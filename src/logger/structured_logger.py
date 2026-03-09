@@ -112,10 +112,6 @@ class StructuredLogger:
     ) -> None:
         ratio = estimated_tokens / max_tokens * 100 if max_tokens else 0
         self.log(LogEvent.LLM_REQUEST, {"model": model, "messages_count": messages_count, "estimated_tokens": estimated_tokens, "tools_count": tools_count})
-        self.console.print(
-            f"[dim]⟳ {model} · {tools_count} 工具 · {messages_count} 消息 · "
-            f"{estimated_tokens:,} tokens ({ratio:.1f}%)[/dim]"
-        )
 
     def llm_stream_start(self, model: str) -> None:
         self.log(LogEvent.LLM_STREAM_START, {"model": model})

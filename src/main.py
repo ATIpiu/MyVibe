@@ -312,17 +312,21 @@ def display_welcome(
     model: str,
     project_root: str = "",
     memory_dir: str = "",
+    tools_count: int = 0,
+    max_context: int = 200_000,
 ) -> None:
     """显示启动 Banner。"""
     lines = [
-        f"[bold cyan]AI Coding Agent[/bold cyan]  [dim]v0.1.0[/dim]",
-        f"[dim]Session:[/dim] {session_id}   [dim]Model:[/dim] {model}",
+        f"[bold cyan]MyVibe[/bold cyan]  [dim]v0.1.0[/dim]",
+        f"[dim]会话 ID:[/dim]  {session_id}",
+        f"[dim]模  型:[/dim]  {model}   "
+        f"[dim]上下文上限:[/dim] {max_context // 1000}K tokens",
     ]
+    if tools_count:
+        lines.append(f"[dim]工具数:[/dim]   {tools_count} 个可用工具（文件/Shell/Git/LSP/记忆等）")
     if project_root:
-        lines.append(f"[dim]Project:[/dim]  {project_root}")
-    if memory_dir:
-        lines.append(f"[dim]Memory:[/dim]   {memory_dir}")
-    lines.append("[dim]输入 /help 查看命令，Ctrl+P 切换计划模式，Ctrl+C 退出[/dim]")
+        lines.append(f"[dim]项目目录:[/dim] {project_root}")
+    lines.append("[dim]输入 /help 查看命令  ·  Ctrl+P 切换计划模式  ·  Ctrl+C 中断[/dim]")
     console.print(Panel("\n".join(lines), border_style="cyan", expand=False))
 
 
@@ -583,16 +587,16 @@ def main() -> None:
     )
 
     model_name = config.get("llm", {}).get("model", "claude-sonnet-4-6")
-    memory_dir = str(Path(project_root) / ".vibecoding" / "memory")
+    tools_count = len(agent._tools_schema)
 
     # 执行模式分支
     if args.print:
-        display_welcome(console, session_id, model_name, project_root, memory_dir)
+        display_welcome(console, session_id, model_name, project_root, tools_count=tools_count)
         sync_and_display_memory(console, memory_manager)
         exit_code = run_headless(agent, args.print)
         sys.exit(exit_code)
     else:
-        display_welcome(console, session_id, model_name, project_root, memory_dir)
+        display_welcome(console, session_id, model_name, project_root, tools_count=tools_count)
         sync_and_display_memory(console, memory_manager)
         run_interactive_loop(agent, session_manager, cwd)
 
