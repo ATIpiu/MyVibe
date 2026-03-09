@@ -391,8 +391,20 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
 
         def get_prompt():
             if agent.state.plan_mode:
-                return HTML('<ansigreen>[计划模式]</ansigreen> <b>[你]</b> ')
+                return HTML('<ansigreen>[计划]</ansigreen> <b>[你]</b> ')
             return HTML('<b>[你]</b> ')
+
+        def get_toolbar():
+            """底部状态栏：显示模型、轮次、累计费用。"""
+            model = agent.llm.model
+            turn = agent.state.turn
+            cost = agent.state.total_cost_usd
+            in_tok = agent.state.total_input_tokens
+            plan = " · <ansigreen>[计划模式]</ansigreen>" if agent.state.plan_mode else ""
+            return HTML(
+                f" <b>{model}</b> · Turn {turn} · "
+                f"{in_tok:,} tokens · ¥{cost:.4f}{plan}"
+            )
 
         kb = KeyBindings()
 
@@ -407,8 +419,9 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
             history=FileHistory(str(history_file)),
             completer=completer,
             auto_suggest=AutoSuggestFromHistory(),
-            complete_while_typing=True,   # 输入 @/#// 后自动弹出补全列表
+            complete_while_typing=True,
             key_bindings=kb,
+            bottom_toolbar=get_toolbar,
         )
 
         while True:

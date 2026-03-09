@@ -35,15 +35,8 @@ class StructuredLogger:
         self._turn = turn
 
     def turn_start(self, turn: int, user_input: str) -> None:
-        """打印轮次 banner 和用户输入。"""
+        """记录轮次开始（不打印 panel，避免重复显示用户输入）。"""
         self.log("turn_start", {"turn": turn, "user_input": user_input[:500]})
-        preview = user_input if len(user_input) <= 300 else user_input[:300] + f"\n[dim]… 共 {len(user_input)} 字符[/dim]"
-        self.console.print(Panel(
-            preview,
-            title=f"[bold white]Turn {turn} — 用户输入[/bold white]",
-            border_style="white",
-            expand=False,
-        ))
 
     def turn_end(self, turn: int, iterations: int, total_input: int, total_output: int, total_cached: int, total_reasoning: int, total_cost: float) -> None:
         """打印轮次结束汇总（含思考链 tokens）。"""
@@ -119,13 +112,10 @@ class StructuredLogger:
     ) -> None:
         ratio = estimated_tokens / max_tokens * 100 if max_tokens else 0
         self.log(LogEvent.LLM_REQUEST, {"model": model, "messages_count": messages_count, "estimated_tokens": estimated_tokens, "tools_count": tools_count})
-        content = (
-            f"  [dim]模型:[/dim] [bold]{model}[/bold]    [dim]工具数:[/dim] {tools_count}\n"
-            f"  [dim]消息数:[/dim] {messages_count}   "
-            f"[dim]估算 tokens:[/dim] {estimated_tokens:,} / {max_tokens:,} ({ratio:.1f}%)"
+        self.console.print(
+            f"[dim]⟳ {model} · {tools_count} 工具 · {messages_count} 消息 · "
+            f"{estimated_tokens:,} tokens ({ratio:.1f}%)[/dim]"
         )
-        panel = Panel(content, title="[bold magenta]LLM Request[/bold magenta]", border_style="magenta", expand=False)
-        self.console.print(panel)
 
     def llm_stream_start(self, model: str) -> None:
         self.log(LogEvent.LLM_STREAM_START, {"model": model})
