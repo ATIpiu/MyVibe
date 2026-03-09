@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "ai-coding-agent"
+version = "0.1.0"
+description = "AI Coding Agent - Claude Code style CLI agent built with Python"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.34.0",
+    "rich>=13.7.0",
+    "pyyaml>=6.0.1",
+    "gitpython>=3.1.43",
+    "prompt_toolkit>=3.0.47",
+    "pathspec>=0.12.1",
+    "requests"
+]
+
+[project.scripts]
+agent = "src.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

@@ -1,0 +1,7 @@
+anthropic
+rich
+pyyaml
+gitpython
+prompt_toolkit
+pathspec
+requests
