@@ -254,18 +254,17 @@ class CodingAgent(BaseAgent):
             tool_results = self.handle_tool_calls(response.tool_calls)
             self.state.append_tool_results(tool_results)
 
-        self.logger.turn_end(
-            self.state.turn, iteration,
-            turn_total_input, turn_total_output, turn_total_cached,
-            turn_total_reasoning, turn_total_cost,
-        )
-
-        # 自动 git commit（记录本轮用户输入为 commit message，携带 session_id）
-        commit_hash = auto_commit_turn(
-            self.state.cwd, self.state.turn, user_input, self.state.session_id
-        )
-        if commit_hash:
-            self.logger.log("git_auto_commit", {"turn": self.state.turn, "hash": commit_hash})
+        if not self._cancel.is_set():
+            self.logger.turn_end(
+                self.state.turn, iteration,
+                turn_total_input, turn_total_output, turn_total_cached,
+                turn_total_reasoning, turn_total_cost,
+            )
+            commit_hash = auto_commit_turn(
+                self.state.cwd, self.state.turn, user_input, self.state.session_id
+            )
+            if commit_hash:
+                self.logger.log("git_auto_commit", {"turn": self.state.turn, "hash": commit_hash})
 
         return final_text
 

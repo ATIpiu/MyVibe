@@ -6,3 +6,4 @@ prompt_toolkit
 pathspec
 requests
 python-lsp-server
+yaml

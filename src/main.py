@@ -327,26 +327,29 @@ def display_welcome(
 
 
 def sync_and_display_memory(console: Console, memory_manager) -> None:
-    """启动时：用 AST 扫描更新记忆索引（不调 LLM），完成后显示统计。"""
+    """后台线程启动 AST 扫描，不阻塞交互循环，完成后打印统计。"""
     import json
-    try:
-        console.print("[dim]正在扫描项目代码记忆...[/dim]", end="")
-        result = memory_manager.sync()  # 纯 AST 扫描，无 LLM 调用
-        all_memory = memory_manager.read_all()
-        total_modules = len(all_memory)
-        total_functions = sum(len(m.functions) for m in all_memory.values())
-        # 估算 token：将记忆序列化为 JSON 后按 4 字符/token 粗算
-        json_str = json.dumps(
-            {k: v.to_dict() for k, v in all_memory.items()},
-            ensure_ascii=False,
-        )
-        est_tokens = len(json_str) // 4
-        console.print(
-            f"\r[dim]记忆索引：{total_modules} 个模块，{total_functions} 个函数，"
-            f"约 {est_tokens:,} tokens[/dim]"
-        )
-    except Exception as e:
-        console.print(f"\r[dim]记忆扫描失败：{e}[/dim]")
+
+    def _sync():
+        try:
+            memory_manager.sync()
+            all_memory = memory_manager.read_all()
+            total_modules = len(all_memory)
+            total_functions = sum(len(m.functions) for m in all_memory.values())
+            json_str = json.dumps(
+                {k: v.to_dict() for k, v in all_memory.items()},
+                ensure_ascii=False,
+            )
+            est_tokens = len(json_str) // 4
+            console.print(
+                f"[dim]记忆索引：{total_modules} 个模块，{total_functions} 个函数，"
+                f"约 {est_tokens:,} tokens[/dim]"
+            )
+        except Exception as e:
+            console.print(f"[dim]记忆扫描失败：{e}[/dim]")
+
+    t = threading.Thread(target=_sync, daemon=True, name="memory-sync")
+    t.start()
 
 
 def display_memory_stats(console: Console, memory_manager) -> None:

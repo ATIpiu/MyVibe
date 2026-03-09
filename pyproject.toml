@@ -15,7 +15,8 @@ dependencies = [
     "prompt_toolkit>=3.0.47",
     "pathspec>=0.12.1",
     "requests",
-    "python-lsp-server"
+    "python-lsp-server",
+    "yaml"
 ]
 
 [project.scripts]
