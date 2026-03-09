@@ -5,3 +5,4 @@ gitpython
 prompt_toolkit
 pathspec
 requests
+python-lsp-server

@@ -33,6 +33,7 @@ import src.tools.memory_tools  # noqa: F401
 
 from src.memory.memory_manager import get_memory_manager
 from src.tools.memory_tools import set_memory_manager
+from src.tools.lsp import set_lsp_root
 
 console = Console()
 
@@ -534,6 +535,9 @@ def main() -> None:
     # 初始化记忆管理器
     memory_manager = get_memory_manager(project_root)
     set_memory_manager(memory_manager)
+
+    # 初始化 LSP 客户端（懒启动，首次调用工具时才真正连接）
+    set_lsp_root(project_root)
 
     agent = CodingAgent(
         llm_client=llm_client,
