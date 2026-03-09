@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import uuid
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
@@ -422,15 +423,30 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
                 if handle_slash_command(user_input, agent, session_manager, cwd):
                     continue
 
-            # 运行 Agent
+            # 运行 Agent（后台线程 + 主线程轮询，保证 Ctrl+C 即刻响应）
             console.print()
+            agent._cancel.clear()
+            _exc: list[Exception] = []
+
+            def _run():
+                try:
+                    agent.run_turn(user_input)
+                except Exception as e:
+                    _exc.append(e)
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
             try:
-                agent.run_turn(user_input)
-                print()  # 确保换行
+                while t.is_alive():
+                    t.join(timeout=0.05)
             except KeyboardInterrupt:
+                agent._cancel.set()
                 console.print("\n[yellow]已中断[/yellow]")
-            except Exception as e:
-                console.print(f"\n[bold red]错误: {e}[/bold red]")
+                t.join(timeout=2.0)
+            else:
+                if _exc:
+                    console.print(f"\n[bold red]错误: {_exc[0]}[/bold red]")
+            print()  # 确保换行
 
     except ImportError:
         # prompt_toolkit 未安装，退回简单 input

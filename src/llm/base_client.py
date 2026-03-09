@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import abc
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -207,6 +208,7 @@ class LLMClient(abc.ABC):
         tools: Optional[list[dict]] = None,
         on_text: Optional[Callable[[str], None]] = None,
         on_tool_start: Optional[Callable[[str, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> LLMResponse:
         """流式调用接口。
 
@@ -232,6 +234,7 @@ class LLMClient(abc.ABC):
             tools=tools,
             on_text=on_text,
             on_tool_start=on_tool_start,
+            cancel_event=cancel_event,
         )
 
         self._record_response(response)
@@ -268,6 +271,7 @@ class LLMClient(abc.ABC):
         tools: Optional[list[dict]] = None,
         on_text: Optional[Callable[[str], None]] = None,
         on_tool_start: Optional[Callable[[str, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> LLMResponse:
         """实际流式推理逻辑，由子类提供。"""
 

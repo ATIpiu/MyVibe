@@ -1,6 +1,7 @@
 """CodingAgent：核心 agentic 循环、权限管理、工具并行执行。"""
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -130,6 +131,9 @@ class CodingAgent(BaseAgent):
         # 构建工具 schema
         self._tools_schema = ToolRegistry.all_tools_schema()
 
+        # 中断信号：由外部（main loop）在 Ctrl+C 时 set()
+        self._cancel = threading.Event()
+
     def run_turn(self, user_input: str) -> str:
         """核心 agentic 循环。
 
@@ -173,6 +177,8 @@ class CodingAgent(BaseAgent):
         turn_total_cost = 0.0
         MAX_ITERATIONS = 20  # 防止无限循环（降低上限减少 token 累积）
         while iteration < MAX_ITERATIONS:
+            if self._cancel.is_set():
+                break
             iteration += 1
 
             # 估算 token
@@ -191,6 +197,7 @@ class CodingAgent(BaseAgent):
                 tools=self._tools_schema,
                 on_text=self._on_stream_text,
                 on_tool_start=self.logger.llm_stream_tool,
+                cancel_event=self._cancel,
             )
 
             _in       = response.usage["input_tokens"]
@@ -240,7 +247,7 @@ class CodingAgent(BaseAgent):
             self.session_manager.save(self.state)
 
             # 检查 stop_reason：有 tool_calls 就执行，否则结束
-            if not response.tool_calls:
+            if not response.tool_calls or self._cancel.is_set():
                 break
 
             # 执行工具调用
@@ -270,6 +277,14 @@ class CodingAgent(BaseAgent):
             tool_name = tc.name
             tool_use_id = tc.tool_use_id
             args = tc.input
+
+            if self._cancel.is_set():
+                return idx, {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": "已中断",
+                    "is_error": True,
+                }
 
             self.logger.tool_call(tool_name, args, tool_use_id)
             self._render_tool_call(tool_name, args)

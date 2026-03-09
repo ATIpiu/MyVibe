@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Callable, Optional, Tuple
 
@@ -201,6 +202,7 @@ class ZhipuLLMClient(LLMClient):
         tools: Optional[list[dict]] = None,
         on_text: Optional[Callable[[str], None]] = None,
         on_tool_start: Optional[Callable[[str, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> LLMResponse:
         import requests
 
@@ -244,6 +246,8 @@ class ZhipuLLMClient(LLMClient):
                 self._raise_for_api_error(r)
 
                 for raw_line in r.iter_lines():
+                    if cancel_event and cancel_event.is_set():
+                        break
                     if not raw_line:
                         continue
                     line = raw_line.decode("utf-8").strip()
