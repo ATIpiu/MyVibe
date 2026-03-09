@@ -1,9 +1,9 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
-name = "ai-coding-agent"
+name = "MyVibe"
 version = "0.1.0"
 description = "AI Coding Agent - Claude Code style CLI agent built with Python"
 requires-python = ">=3.11"
@@ -14,11 +14,12 @@ dependencies = [
     "gitpython>=3.1.43",
     "prompt_toolkit>=3.0.47",
     "pathspec>=0.12.1",
-    "requests"
+    "requests",
+    "python-lsp-server"
 ]
 
 [project.scripts]
-agent = "src.main:main"
+myvibe = "src.main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
