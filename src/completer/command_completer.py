@@ -40,6 +40,11 @@ class CommandCompleter(Completer):
                 usage="/init"
             ),
             CommandInfo(
+                name="/context",
+                description="查看上下文用量、系统提示词、MyVibe.md 及记忆统计",
+                usage="/context"
+            ),
+            CommandInfo(
                 name="/clear",
                 description="清除当前对话历史",
                 usage="/clear"
