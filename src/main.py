@@ -616,6 +616,12 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
             except Exception as e:
                 console.print(f"\n[bold red]错误: {e}[/bold red]")
 
+    # 退出前等待命名线程写入完成（最多 8 秒，避免显示"未命名"）
+    nt = getattr(agent, "_naming_thread", None)
+    if nt and nt.is_alive():
+        console.print("[dim]正在保存会话名称...[/dim]", end="\r")
+        nt.join(timeout=8.0)
+
 
 def pick_session(console: Console, session_manager: SessionManager, cwd: str) -> Optional[str]:
     """启动时展示当前目录的历史会话，让用户选择是否恢复。返回 session_id 或 None。"""

@@ -133,6 +133,8 @@ class CodingAgent(BaseAgent):
 
         # 中断信号：由外部（main loop）在 Ctrl+C 时 set()
         self._cancel = threading.Event()
+        # 命名线程引用：退出前可 join 等待完成
+        self._naming_thread: Optional[threading.Thread] = None
 
     def run_turn(self, user_input: str) -> str:
         """核心 agentic 循环。
@@ -442,7 +444,9 @@ class CodingAgent(BaseAgent):
             except Exception:
                 pass
 
-        threading.Thread(target=_run, daemon=True, name="session-namer").start()
+        t = threading.Thread(target=_run, daemon=True, name="session-namer")
+        self._naming_thread = t
+        t.start()
 
     def _build_proactive_memory(self, user_input: str) -> str:
         """根据用户输入主动搜索相关函数记忆，注入系统提示词。"""
