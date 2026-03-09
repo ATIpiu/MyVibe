@@ -280,6 +280,10 @@ def handle_slash_command(
         display_memory_stats(console, agent._memory_manager)
         return True
 
+    elif cmd == "/context":
+        _show_context(console, agent, cwd)
+        return True
+
     elif cmd == "/plan":
         agent.state.plan_mode = not agent.state.plan_mode
         status = "开启" if agent.state.plan_mode else "关闭"
@@ -290,6 +294,7 @@ def handle_slash_command(
         help_text = (
             "[bold]可用斜杠命令：[/bold]\n"
             "  /init          - 扫描项目并用 LLM 生成 MyVibe.md 项目记忆\n"
+            "  /context       - 查看上下文用量、系统提示词、MyVibe.md 及记忆统计\n"
             "  /clear         - 清除当前对话历史\n"
             "  /compact       - 压缩对话历史（节省 tokens）\n"
             "  /cost          - 显示 token 使用量和费用\n"
@@ -304,6 +309,126 @@ def handle_slash_command(
         return True
 
     return False
+
+
+def _show_context(console: Console, agent, cwd: str) -> None:
+    """显示当前上下文概览：额度用量 / 系统提示词 / MyVibe.md / 记忆统计。"""
+    import json
+    from rich.table import Table
+    from rich.rule import Rule
+    from src.agent.project_init import load_myvibe
+
+    state = agent.state
+    MAX_CTX = 200_000
+
+    # ── 1. 上下文额度 ────────────────────────────────────────────
+    used = state.last_response_input_tokens or 0
+    pct = used / MAX_CTX if MAX_CTX else 0
+    bar_width = 36
+    filled = int(bar_width * pct)
+    if pct < 0.6:
+        bar_color = "green"
+    elif pct < 0.85:
+        bar_color = "yellow"
+    else:
+        bar_color = "red"
+    bar = f"[{bar_color}]{'█' * filled}[/{bar_color}][dim]{'░' * (bar_width - filled)}[/dim]"
+
+    console.print(Rule("[bold cyan]上下文概览[/bold cyan]", style="cyan"))
+    console.print(f"  {bar}  [{bar_color}]{used:,}[/{bar_color}][dim] / {MAX_CTX // 1000}K tokens  ({pct:.1%})[/dim]")
+    console.print()
+
+    # ── 2. 上下文组成明细 ────────────────────────────────────────
+    sys_prompt = state.system_prompt or ""
+    sys_tokens = len(sys_prompt) // 4
+    msg_chars = sum(
+        len(json.dumps(m.get("content", ""), ensure_ascii=False))
+        for m in state.messages
+    )
+    msg_tokens = msg_chars // 4
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column(style="dim", width=16)
+    table.add_column()
+    table.add_column(justify="right", style="cyan")
+    table.add_row("系统提示词",  f"[dim]含工具描述、规则、主动记忆注入等[/dim]",  f"~{sys_tokens:,} tokens")
+    table.add_row("对话历史",    f"[dim]{len(state.messages)} 条消息（用户/助手/工具结果）[/dim]", f"~{msg_tokens:,} tokens")
+    console.print(table)
+    console.print()
+
+    # ── 3. 系统提示词预览 ────────────────────────────────────────
+    if sys_prompt:
+        preview = sys_prompt[:600] + ("\n[dim]… 仅展示前 600 字符[/dim]" if len(sys_prompt) > 600 else "")
+        console.print(Panel(
+            preview,
+            title=f"[bold]系统提示词[/bold]  [dim]{len(sys_prompt):,} 字符 / ~{sys_tokens:,} tokens[/dim]",
+            border_style="dim",
+            expand=False,
+        ))
+    else:
+        console.print("[dim]  系统提示词：尚未生成（第一轮对话后可见）[/dim]")
+    console.print()
+
+    # ── 4. MyVibe.md ─────────────────────────────────────────────
+    myvibe = load_myvibe(cwd)
+    if myvibe:
+        mv_tokens = len(myvibe) // 4
+        mv_preview = myvibe[:400] + ("\n[dim]… 仅展示前 400 字符[/dim]" if len(myvibe) > 400 else "")
+        console.print(Panel(
+            mv_preview,
+            title=f"[bold]MyVibe.md[/bold]  [dim]{len(myvibe):,} 字符 / ~{mv_tokens:,} tokens[/dim]",
+            border_style="blue",
+            expand=False,
+        ))
+    else:
+        console.print(Panel(
+            "[dim]未找到 MyVibe.md，运行 /init 可自动生成[/dim]",
+            title="[bold]MyVibe.md[/bold]",
+            border_style="dim",
+            expand=False,
+        ))
+    console.print()
+
+    # ── 5. 记忆系统统计 ──────────────────────────────────────────
+    try:
+        all_memory = agent._memory_manager.read_all()
+        total_modules = len(all_memory)
+        total_funcs = sum(len(m.functions) for m in all_memory.values())
+        mem_json = json.dumps(
+            {k: v.to_dict() for k, v in all_memory.items()}, ensure_ascii=False
+        )
+        total_mem_tokens = len(mem_json) // 4
+    except Exception:
+        total_modules = total_funcs = total_mem_tokens = 0
+
+    mem_tool_calls = state.memory_tool_calls
+    mem_tool_tokens = state.memory_tool_tokens
+
+    mem_table = Table(show_header=False, box=None, padding=(0, 2))
+    mem_table.add_column(style="dim", width=20)
+    mem_table.add_column()
+    mem_table.add_column(justify="right", style="cyan")
+    mem_table.add_row(
+        "记忆索引总量",
+        f"[dim]{total_modules} 个模块 · {total_funcs} 个函数[/dim]",
+        f"~{total_mem_tokens:,} tokens",
+    )
+    mem_table.add_row(
+        "  [dim]⚠ 注意[/dim]",
+        "[dim]记忆索引不会全量注入，每轮仅注入与请求最相关的 top-8 条[/dim]",
+        "",
+    )
+    mem_table.add_row(
+        "本会话 read_memory",
+        f"[dim]主动调用 {mem_tool_calls} 次，结果写入对话历史[/dim]",
+        f"~{mem_tool_tokens:,} tokens" if mem_tool_calls > 0 else "[dim]0[/dim]",
+    )
+    console.print(Panel(
+        mem_table,
+        title="[bold]记忆系统[/bold]",
+        border_style="magenta",
+        expand=False,
+    ))
 
 
 def display_welcome(

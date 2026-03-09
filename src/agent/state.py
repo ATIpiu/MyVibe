@@ -32,6 +32,9 @@ class AgentState:
     last_response_input_tokens: int = 0
     # 计划模式开关
     plan_mode: bool = False
+    # 记忆工具调用追踪（统计本会话中 read_memory 实际注入上下文的量）
+    memory_tool_calls: int = 0
+    memory_tool_tokens: int = 0
 
     def append_user(self, content: str) -> None:
         """追加用户消息。"""

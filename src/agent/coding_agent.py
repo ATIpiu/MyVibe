@@ -343,6 +343,11 @@ class CodingAgent(BaseAgent):
                 if tool_name == "read_file" and not result.is_error:
                     self.state.mark_file_read(args.get("file_path", ""))
 
+                # 记忆工具调用：累计注入上下文的 token 量
+                if tool_name == "read_memory" and not result.is_error:
+                    self.state.memory_tool_calls += 1
+                    self.state.memory_tool_tokens += len(result.content or "") // 4
+
                 elapsed = int(time.monotonic() * 1000) - start_ms
                 full_content = result.content or ""
                 summary = full_content[:80].replace("\n", " ")
