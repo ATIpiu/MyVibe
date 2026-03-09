@@ -64,22 +64,22 @@ export ANTHROPIC_API_KEY="your_key" # Anthropic Claude
 python -m src.main
 
 # 或通过 pyproject.toml 安装后
-agent
+myvibe
 
 # 一次性执行（headless 模式）
-agent -p "用 Python 写一个快速排序并附上测试"
+myvibe -p "用 Python 写一个快速排序并附上测试"
 
 # 继续上次会话
-agent --continue
+myvibe --continue
 
 # 恢复指定会话
-agent --resume <session_id>
+myvibe --resume <session_id>
 
 # 指定模型
-agent --model glm-4-flash
+myvibe --model glm-4-flash
 
 # 指定工作目录
-agent --cwd /path/to/project
+myvibe --cwd /path/to/project
 ```
 
 ---
