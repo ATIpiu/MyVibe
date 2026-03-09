@@ -262,6 +262,10 @@ class CodingAgent(BaseAgent):
             tool_results = self.handle_tool_calls(response.tool_calls)
             self.state.append_tool_results(tool_results)
 
+        # Turn 1 结束后，用隔离子 Agent 命名会话（不影响主上下文）
+        if self.state.turn == 1 and not self.state.name and not self._cancel.is_set():
+            self._name_session_async()
+
         if not self._cancel.is_set():
             self.logger.turn_end(
                 self.state.turn, iteration,
@@ -405,6 +409,40 @@ class CodingAgent(BaseAgent):
     def _render_tool_call(self, tool_name: str, args: dict) -> None:
         """（已在 logger.tool_call 中渲染，此处保留扩展点）"""
         pass
+
+    def _name_session_async(self) -> None:
+        """子 Agent：根据第一条用户消息为会话命名。
+
+        完全隔离：直接调用 _stream_chat_impl 绕过历史记录，
+        结果只写入 state.name，不污染主对话上下文。
+        """
+        first_msg = next(
+            (m for m in self.state.messages if m.get("role") == "user"), None
+        )
+        first_content = first_msg.get("content", "") if first_msg else ""
+        if not first_content or not isinstance(first_content, str):
+            return
+
+        state_ref = self.state
+        session_manager_ref = self.session_manager
+        llm_ref = self.llm
+
+        def _run() -> None:
+            try:
+                resp = llm_ref._stream_chat_impl(
+                    messages=[{"role": "user", "content":
+                        f"用不超过10个字为这个对话命名（只输出名称，无标点无解释）：{first_content[:300]}"}],
+                    system="你是对话命名助手，只输出简洁标题，不超过10个字，无标点。",
+                    tools=[],
+                )
+                name = (resp.text_content or "").strip()[:20]
+                if name:
+                    state_ref.name = name
+                    session_manager_ref.save(state_ref)
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True, name="session-namer").start()
 
     def _build_proactive_memory(self, user_input: str) -> str:
         """根据用户输入主动搜索相关函数记忆，注入系统提示词。"""

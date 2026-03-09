@@ -617,6 +617,57 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
                 console.print(f"\n[bold red]错误: {e}[/bold red]")
 
 
+def pick_session(console: Console, session_manager: SessionManager, cwd: str) -> Optional[str]:
+    """启动时展示当前目录的历史会话，让用户选择是否恢复。返回 session_id 或 None。"""
+    from rich.table import Table
+    from rich.prompt import Prompt
+
+    # 只展示与当前 cwd 匹配的会话
+    all_sessions = session_manager.list_sessions()
+    sessions = [s for s in all_sessions if s.get("cwd") == cwd]
+    if not sessions:
+        return None
+
+    table = Table(title="本目录历史会话", show_header=True, header_style="bold cyan", box=None)
+    table.add_column("#", style="bold", width=3, justify="right")
+    table.add_column("名称", min_width=14)
+    table.add_column("ID", style="dim", width=10)
+    table.add_column("轮次", justify="right", width=5)
+    table.add_column("费用", justify="right", width=9)
+    table.add_column("时间", style="dim", width=16)
+
+    for i, s in enumerate(sessions[:10], 1):
+        name = s.get("name") or "[dim]未命名[/dim]"
+        table.add_row(
+            str(i),
+            name,
+            s["session_id"],
+            str(s["turn"]),
+            f"¥{s['cost_usd']:.4f}",
+            s["modified"],
+        )
+
+    console.print(table)
+
+    try:
+        choice = Prompt.ask(
+            "[dim]输入编号恢复会话，直接回车新建[/dim]",
+            default="",
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+    if not choice:
+        return None
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(sessions):
+            return sessions[idx]["session_id"]
+    except ValueError:
+        pass
+    return None
+
+
 def run_headless(agent: CodingAgent, prompt: str) -> int:
     """-p 一次性执行，返回 exit code。"""
     try:
@@ -651,6 +702,12 @@ def main() -> None:
 
     state: Optional[AgentState] = None
     session_id: Optional[str] = None
+
+    # 没有显式指定 --resume / --continue 时，交互式选择历史会话
+    if not args.resume and not args.continue_session and not args.print:
+        chosen = pick_session(console, session_manager, cwd)
+        if chosen:
+            args.resume = chosen
 
     if args.resume:
         session_id = args.resume

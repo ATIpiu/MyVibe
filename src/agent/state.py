@@ -35,6 +35,8 @@ class AgentState:
     # 记忆工具调用追踪（统计本会话中 read_memory 实际注入上下文的量）
     memory_tool_calls: int = 0
     memory_tool_tokens: int = 0
+    # 会话名称（由子 Agent 根据第一条用户消息自动生成）
+    name: str = ""
 
     def append_user(self, content: str) -> None:
         """追加用户消息。"""
@@ -72,6 +74,7 @@ class AgentState:
     def to_dict(self) -> dict:
         return {
             "session_id": self.session_id,
+            "name": self.name,
             "system_prompt": self.system_prompt,
             "messages": self.messages,
             "read_files": list(self.read_files),
@@ -87,6 +90,7 @@ class AgentState:
     def from_dict(cls, data: dict) -> "AgentState":
         state = cls(session_id=data["session_id"])
         state.messages = data.get("messages", [])
+        state.name = data.get("name", "")
         state.system_prompt = data.get("system_prompt", "")
         state.read_files = set(data.get("read_files", []))
         state.cwd = data.get("cwd", ".")
@@ -149,6 +153,7 @@ class SessionManager:
                 if state:
                     sessions.append({
                         "session_id": session_id,
+                        "name": state.name,
                         "turn": state.turn,
                         "messages": len(state.messages),
                         "cost_usd": state.total_cost_usd,
