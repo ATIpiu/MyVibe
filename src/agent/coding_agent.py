@@ -200,6 +200,14 @@ class CodingAgent(BaseAgent):
                 cancel_event=self._cancel,
             )
 
+            # 流式文本结束后换行，避免 log 紧跟在响应末尾
+            if response.text_content:
+                print()
+
+            # 中断时跳过所有后续日志和状态更新
+            if self._cancel.is_set():
+                break
+
             _in       = response.usage["input_tokens"]
             _out      = response.usage["output_tokens"]
             _cached   = response.usage.get("cached_tokens", 0)
