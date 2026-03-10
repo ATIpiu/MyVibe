@@ -11,11 +11,11 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 
 from .base_agent import BaseAgent
-from .project_init import load_myvibe
+
 from .state import AgentState, SessionManager
 from ..context.context_manager import ContextManager
 from ..llm.client import LLMClient, ToolCall
-from ..llm.prompts import build_system_prompt, build_tool_descriptions, load_memory_context
+from ..llm.prompts import build_system_prompt, build_tool_descriptions
 from ..logger.structured_logger import StructuredLogger
 from ..tools.base_tool import ToolRegistry
 from ..tools.context_tools import set_context_manager
@@ -27,15 +27,6 @@ from ..memory.memory_manager import get_memory_manager
 DEFAULT_AUTO_ALLOW = {
     "read_file", "search_in_file", "git_status", "git_diff",
     "read_memory", "lsp_hover",
-}
-
-# 计划模式下允许使用的只读工具（禁止写入/执行类工具）
-PLAN_MODE_READONLY_TOOLS = {
-    "read_file", "search_in_file",
-    "git_status", "git_diff",
-    "read_memory", "rebuild_memory",
-    "lsp_hover", "lsp_definition",
-    "get_context_info",
 }
 
 MODEL_MAX_TOKENS = 200_000
@@ -205,6 +196,14 @@ class CodingAgent(BaseAgent):
         # 将 cancel 事件注入权限管理器，Ctrl+C 时跳过 stdin 阻塞
         self.permission._cancel_event = self._cancel
 
+        # 系统提示词只在初始化时构建一次，后续不再修改
+        self._system = build_system_prompt(
+            tool_descriptions="",
+            cwd=self.state.cwd,
+            tool_count=len(self._tools_schema),
+        )
+        self.state.system_prompt = self._system
+
     def run_turn(self, user_input: str) -> str:
         """核心 agentic 循环。
 
@@ -219,34 +218,8 @@ class CodingAgent(BaseAgent):
 
         self.check_compress()
 
-        # 构建系统提示词（不含工具描述，tools schema 已通过 API 参数传递）
-        memory = load_memory_context(
-            "~/.claude/AGENT.md",
-            str(self.context_manager.project_root / "AGENT.md"),
-        )
-        myvibe = load_myvibe(self.state.cwd)
-        proactive_memory = self._build_proactive_memory(user_input)
-        system = build_system_prompt(
-            tool_descriptions="",
-            cwd=self.state.cwd,
-            memory_context=memory,
-            tool_count=len(self._tools_schema),
-            proactive_memory=proactive_memory,
-            myvibe_context=myvibe,
-            plan_mode=self.state.plan_mode,
-        )
-
-        # 将系统提示词同步到 state，便于 .agent_sessions JSONL 完整记录
-        self.state.system_prompt = system
-
-        # 计划模式：只开放只读工具，禁止写入/执行类操作
-        if self.state.plan_mode:
-            active_tools = [
-                t for t in self._tools_schema
-                if t["name"] in PLAN_MODE_READONLY_TOOLS
-            ]
-        else:
-            active_tools = self._tools_schema
+        system = self._system
+        active_tools = self._tools_schema
 
         final_text = ""
         iteration = 0
@@ -533,16 +506,3 @@ class CodingAgent(BaseAgent):
         self._naming_thread = t
         t.start()
 
-    def _build_proactive_memory(self, user_input: str) -> str:
-        """根据用户输入主动搜索相关函数记忆，注入系统提示词。"""
-        try:
-            results = self._memory_manager.search(query=user_input, top_k=8)
-            if not results:
-                return ""
-            lines = ["## 相关函数记忆（自动检索）", ""]
-            for module_path, qualname, func_data in results:
-                key = f"{module_path}:{qualname}"
-                lines.append(f"- `{key}`: {func_data.purpose or '（无描述）'}")
-            return "\n".join(lines)
-        except Exception:
-            return ""

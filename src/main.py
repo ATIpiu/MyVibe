@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import re
 import sys
 import threading
 import uuid
@@ -19,6 +18,7 @@ from rich.table import Table
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.agent.coding_agent import CodingAgent, PermissionManager
+from src.agent.plan_agent import PlanAgent, PLAN_MODE_READONLY_TOOLS
 from src.agent.state import AgentState, SessionManager
 from src.context.context_manager import ContextManager
 from src.llm.client import create_client_from_config
@@ -519,68 +519,167 @@ def display_memory_stats(console: Console, memory_manager) -> None:
         pass
 
 
-# ─────────────────── 计划模式交互式选择器 ────────────────────
+# ─────────────────── 计划模式问题解析与交互 ────────────────────
 
-_OPT_RE = re.compile(r"^\s*(\d+)[.、。]\s+(.+)")
+def _has_plan_questions(text: str) -> bool:
+    """检测计划文本中是否含有待确认问题块。"""
+    import re
+    return bool(re.search(r'\*\*问题\s*\d*\s*[：:]', text))
 
 
-def _parse_plan_questions(text: str) -> list[tuple[str, list[str]]]:
-    """从 LLM 计划响应中解析所有「问题+选项」块。
+def _parse_plan_questions(text: str) -> "list[tuple[str, list[str]]]":
+    """从计划文本解析问题标题和选项列表。
 
-    返回 [(question_header, [opt1, opt2, ...]), ...]
-    header 取该编号列表前最近一条非空行，可为空字符串。
+    Returns:
+        [(question_label, [opt1, opt2, ...]), ...]
     """
-    lines = text.split("\n")
-    results: list[tuple[str, list[str]]] = []
-    i = 0
-    while i < len(lines):
-        m = _OPT_RE.match(lines[i])
-        if m and int(m.group(1)) == 1:
-            opts = [m.group(2).strip()]
-            expected = 2
-            j = i + 1
-            while j < len(lines):
-                stripped = lines[j].strip()
-                if not stripped:
-                    j += 1
-                    continue
-                m2 = _OPT_RE.match(stripped)
-                if m2 and int(m2.group(1)) == expected:
-                    opts.append(m2.group(2).strip())
-                    expected += 1
-                    j += 1
+    import re
+    result = []
+    # 按 **问题 N：...** 分割
+    pattern = r'\*\*问题\s*(\d*)\s*[：:]\s*([^*]+?)\*\*'
+    headers = [(m.group(0), m.group(1), m.group(2).strip(), m.start())
+               for m in re.finditer(pattern, text)]
+    if not headers:
+        return result
+
+    for i, (full_match, num, q_text, start) in enumerate(headers):
+        end = headers[i + 1][3] if i + 1 < len(headers) else len(text)
+        block = text[start:end]
+        # 提取数字编号选项
+        options = [m.group(1).strip()
+                   for m in re.finditer(r'^\d+\.\s+(.+)$', block, re.MULTILINE)
+                   if m.group(1).strip()]
+        if not options:
+            continue
+        label = f"问题 {num}：{q_text}" if num else f"问题：{q_text}"
+        result.append((label, options))
+    return result
+
+
+def _keypress_select(
+    n: int,
+    prompt_session,
+    hint: str = "",
+) -> "Optional[int]":
+    """按下数字键 1-n 立即返回对应下标（0-based），无需 Enter。
+
+    利用 prompt_session 的自定义 key_bindings：按数字键时直接将
+    该字符写入 buffer 并调用 validate_and_handle()（相当于按 Enter）。
+    Returns None 表示用户取消（Ctrl+C / ESC）。
+    """
+    try:
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.formatted_text import HTML
+    except ImportError:
+        # 没有 prompt_toolkit，退回普通 input
+        try:
+            raw = input(hint or f"请选择 [1-{n}]：").strip()
+            idx = int(raw) - 1
+            return idx if 0 <= idx < n else None
+        except (ValueError, EOFError, KeyboardInterrupt):
+            return None
+
+    kb = KeyBindings()
+
+    for digit in range(1, min(n + 1, 10)):
+        @kb.add(str(digit))
+        def _(event, d=digit):
+            event.app.current_buffer.text = str(d)
+            event.app.current_buffer.validate_and_handle()
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _cancel(event):
+        # 写入空字符串后提交，调用方检测到空串视为取消
+        event.app.current_buffer.text = ""
+        event.app.current_buffer.validate_and_handle()
+
+    label = hint or f"按 1-{n} 选择（直接按键，无需 Enter）："
+    try:
+        if prompt_session is not None:
+            raw = prompt_session.prompt(
+                HTML(f"<ansiyellow>{label}</ansiyellow> "),
+                key_bindings=kb,
+            ).strip()
+        else:
+            raw = input(label + " ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+    if not raw:
+        return None
+    try:
+        idx = int(raw) - 1
+        return idx if 0 <= idx < n else None
+    except ValueError:
+        return None
+
+
+def _ask_plan_questions(
+    plan_text: str,
+    prompt_session,
+    console: Console,
+) -> "Optional[str]":
+    """解析计划文本中的问题，逐题展示并收集用户回答。
+
+    Returns:
+        格式化回答字符串（发回 PlanAgent），None 表示用户取消。
+    """
+    questions = _parse_plan_questions(plan_text)
+    if not questions:
+        return None
+
+    answers: list[str] = []
+    for i, (label, options) in enumerate(questions):
+        # 确保最后一项是自定义
+        if not any(kw in options[-1] for kw in ("自定义", "custom", "其他")):
+            options = options + ["自定义：请输入你的具体想法"]
+
+        n = len(options)
+        while True:
+            console.print(f"\n[bold cyan]{label}[/bold cyan]")
+            for j, opt in enumerate(options, 1):
+                if j == n:
+                    console.print(f"  [dim]{j}. {opt}[/dim]")
                 else:
+                    console.print(f"  [bold]{j}.[/bold] {opt}")
+
+            idx = _keypress_select(n, prompt_session)
+            if idx is None:
+                return None  # 用户取消
+
+            if idx == n - 1:
+                # 自定义输入框
+                try:
+                    from prompt_toolkit.formatted_text import HTML
+                    if prompt_session is not None:
+                        custom = prompt_session.prompt(
+                            HTML("<ansiyellow>  请输入自定义内容：</ansiyellow> ")
+                        ).strip()
+                    else:
+                        custom = input("  请输入自定义内容：").strip()
+                except (EOFError, KeyboardInterrupt):
+                    return None
+                if custom:
+                    console.print(f"[green]  ✓ 自定义：{custom}[/green]")
+                    answers.append(f"{label} → 自定义：{custom}")
                     break
-            if len(opts) >= 2:
-                # 往前找 header（跳过空行，取最近非空行，剥离 Markdown 符号）
-                header = ""
-                for k in range(i - 1, max(-1, i - 5), -1):
-                    prev = lines[k].strip()
-                    if prev:
-                        header = prev.strip("*#> ").strip()
-                        break
-                results.append((header, opts))
-                i = j
-                continue
-        i += 1
-    return results
+                console.print("[yellow]  内容不能为空，请重新输入[/yellow]")
+            else:
+                console.print(f"[green]  ✓ 已选择：{options[idx]}[/green]")
+                answers.append(f"{label} → {options[idx]}")
+                break
+
+    if not answers:
+        return None
+    return (
+        "用户对各问题的回答如下：\n"
+        + "\n".join(f"- {a}" for a in answers)
+        + "\n\n请根据以上选择，输出最终执行计划。"
+    )
 
 
-def _get_last_assistant_text(agent) -> str:
-    """从 agent.state.messages 取最后一条 assistant 消息的文本内容。"""
-    for msg in reversed(agent.state.messages):
-        if msg.get("role") == "assistant":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                return "\n".join(
-                    b.get("text", "")
-                    for b in content
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
-    return ""
-
+# ─────────────────── 计划模式交互式选择器 ────────────────────
 
 def _select_one_question(
     q_idx: int,
@@ -673,144 +772,55 @@ def _select_one_question(
     return idx
 
 
-def _show_review(
-    questions: list[tuple[str, list[str]]],
-    selections: list,
+def _handle_plan_complete(
+    agent,
+    plan_agent,
+    plan_text: str,
+    plan_file,
     console: Console,
-) -> "tuple[bool, int | None]":
-    """汇总确认屏：显示所有选择，支持回头重选。
+    prompt_session=None,
+) -> "Optional[str]":
+    """计划 Agent 完成后展示三选项，返回 _pending_input 或 None。
 
-    返回 (confirmed, redo_idx)：
-      - (True,  None)  → 确认执行
-      - (False, N)     → 重新选择第 N 题
-      - (False, None)  → 取消
+    选项：
+      1. 清理上下文，按计划重新开始
+      2. 直接开始执行（保持当前上下文）
+      3. 继续补充计划内容
     """
-    from prompt_toolkit.application import Application
-    from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.layout import Layout
-    from prompt_toolkit.layout.containers import Window
-    from prompt_toolkit.layout.controls import FormattedTextControl
-    from prompt_toolkit.formatted_text import HTML
+    if plan_file:
+        console.print(f"\n[dim]计划已保存: {plan_file}[/dim]")
 
-    # cursor：0..len-1 对应每道题，len 对应"确认执行"按钮
-    cursor = [len(questions)]
-
-    def sel_text(i: int) -> str:
-        s = selections[i]
-        _, opts = questions[i]
-        if isinstance(s, str):
-            return s
-        return f"{s + 1}. {opts[s]}"
-
-    def get_text():
-        rows: list[str] = []
-        rows.append("<ansicyan><b> ── 确认选择 ── </b></ansicyan>")
-        rows.append("")
-        for i, (hdr, _) in enumerate(questions):
-            title = hdr[:50] + "…" if len(hdr) > 50 else hdr
-            title = title.replace("<", "&lt;").replace(">", "&gt;")
-            desc = sel_text(i)
-            desc_safe = (desc[:65] + "…" if len(desc) > 65 else desc).replace("<", "&lt;").replace(">", "&gt;")
-            if cursor[0] == i:
-                rows.append(
-                    f"  <reverse><b> Q{i + 1}. {title or f'问题{i+1}'} </b></reverse>"
-                    f"  <dim>Enter 重选</dim>"
-                )
-                rows.append(f"     → <ansiyellow>{desc_safe}</ansiyellow>")
-            else:
-                rows.append(f"  <ansigreen>✓</ansigreen> Q{i + 1}. {title or f'问题{i+1}'}")
-                rows.append(f"     → <dim>{desc_safe}</dim>")
-            rows.append("")
-        # 确认按钮
-        if cursor[0] == len(questions):
-            rows.append("  <reverse><b> ✓  确认执行 </b></reverse>")
-        else:
-            rows.append("  <ansiblue>[ ✓ 确认执行 ]</ansiblue>")
-        rows.append("")
-        rows.append(
-            "<ansiblue> ↑/↓</ansiblue> 导航  "
-            "<ansiblue>Enter</ansiblue> 确认/重选  "
-            "<ansiblue>Esc</ansiblue> 取消"
-        )
-        return HTML("\n".join(rows))
-
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _(e):
-        cursor[0] = max(0, cursor[0] - 1)
-
-    @kb.add("down")
-    def _(e):
-        cursor[0] = min(len(questions), cursor[0] + 1)
-
-    @kb.add("enter")
-    def _(e):
-        if cursor[0] == len(questions):
-            e.app.exit(result=("confirm", None))
-        else:
-            e.app.exit(result=("reselect", cursor[0]))
-
-    @kb.add("escape")
-    @kb.add("c-c")
-    def _(e):
-        e.app.exit(result=("cancel", None))
-
-    app = Application(
-        layout=Layout(Window(content=FormattedTextControl(get_text, focusable=True))),
-        key_bindings=kb,
-        full_screen=False,
-        mouse_support=False,
+    console.print(
+        "\n[bold cyan]计划已完成，请选择下一步：[/bold cyan]\n"
+        "  [bold]1.[/bold] 清理上下文，按计划重新开始（新对话）\n"
+        "  [bold]2.[/bold] 直接开始执行（保持当前上下文）\n"
+        "  [bold]3.[/bold] 继续补充计划内容\n"
     )
-    action, idx = app.run()
-    if action == "confirm":
-        return True, None
-    if action == "reselect":
-        return False, idx
-    return False, None
 
+    choice = _keypress_select(3, prompt_session, "按 1-3 选择：")
+    if choice is None:
+        choice = 1  # 默认：直接执行
 
-def _run_plan_wizard(
-    questions: list[tuple[str, list[str]]],
-    console: Console,
-) -> "str | None":
-    """多问题计划向导：依次选题 → 汇总确认（可回头重选） → 返回组合消息。
+    if choice == 0:
+        # 清理上下文 + 以计划内容作为新任务启动
+        agent.state.messages = []
+        agent.state.turn = 0
+        agent.state.plan_mode = False
+        plan_agent.reset()
+        console.print("[bold green]上下文已清理，按计划重新开始...[/bold green]")
+        return f"请按照以下计划执行：\n\n{plan_text}"
 
-    返回 None 表示用户取消。
-    """
-    if not questions:
+    elif choice == 1:
+        # 保持上下文，直接切换到执行模式
+        agent.state.plan_mode = False
+        plan_agent.reset()
+        console.print("[bold green]切换到执行模式，开始执行计划...[/bold green]")
+        return f"请按照以下计划开始执行：\n\n{plan_text}"
+
+    else:
+        # 继续补充计划（plan_mode 保持 True，plan_agent 保留历史）
+        console.print("[dim]继续补充计划内容，请输入补充说明...[/dim]")
         return None
-
-    selections: list = [0] * len(questions)
-
-    # 第一轮：依次选每道题
-    for i, (header, options) in enumerate(questions):
-        sel = _select_one_question(i, len(questions), header, options, 0, console)
-        selections[i] = sel
-
-    # 确认循环：可回头重选
-    while True:
-        confirmed, redo_idx = _show_review(questions, selections, console)
-        if confirmed:
-            break
-        if redo_idx is None:
-            return None  # 用户取消
-        # 重选指定题
-        header, options = questions[redo_idx]
-        cur = selections[redo_idx] if isinstance(selections[redo_idx], int) else 0
-        selections[redo_idx] = _select_one_question(
-            redo_idx, len(questions), header, options, cur, console
-        )
-
-    # 组合发送给 LLM 的消息
-    parts: list[str] = []
-    for i, ((header, options), sel) in enumerate(zip(questions, selections)):
-        q_label = header[:30] if header else f"问题{i + 1}"
-        if isinstance(sel, str):
-            parts.append(f"Q{i + 1}（{q_label}）：{sel}")
-        else:
-            parts.append(f"Q{i + 1}（{q_label}）：{sel + 1}. {options[sel]}")
-    return "\n".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -836,7 +846,6 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
 
         def get_toolbar():
             """底部状态栏：显示模型、轮次、累计费用（含子 Agent）。"""
-            from src.agent.coding_agent import PLAN_MODE_READONLY_TOOLS
             model = agent.llm.model
             turn = agent.state.turn
             cost = agent.llm.session_cost_usd
@@ -857,6 +866,8 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
         def toggle_plan_mode(event):
             agent.state.plan_mode = not agent.state.plan_mode
             status = "开启" if agent.state.plan_mode else "关闭"
+            if agent.state.plan_mode:
+                plan_agent.reset()
             console.print(f"[bold green]计划模式已{status}[/bold green]")
             event.app.invalidate()
 
@@ -870,6 +881,7 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
         )
 
         _pending_input: Optional[str] = None
+        plan_agent = PlanAgent(agent.llm, cwd, console)
 
         while True:
             try:
@@ -886,21 +898,96 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
                 continue
 
             # 处理斜杠命令
+            _plan_mode_before = agent.state.plan_mode
             if user_input.startswith("/"):
                 if handle_slash_command(user_input, agent, session_manager, cwd):
+                    # /plan 命令开启计划模式时重置 plan_agent
+                    if agent.state.plan_mode and not _plan_mode_before:
+                        plan_agent.reset()
                     continue
 
-            # 计划模式：手动输入确认词时退出（向导路径已在 turn 后自动处理）
-            if agent.state.plan_mode:
-                _stripped = user_input.strip().lower()
-                _APPROVE = {"y", "yes", "ok", "好", "好的", "是", "执行", "开始",
-                            "继续", "proceed", "go", "确认", "可以", "行"}
-                if _stripped in _APPROVE:
-                    agent.state.plan_mode = False
-                    console.print("[bold green]计划已确认，退出计划模式，开始执行...[/bold green]")
-
-            # 运行 Agent（后台线程 + 主线程轮询，保证 Ctrl+C 即刻响应）
             console.print()
+
+            # ── 计划模式：路由到 PlanAgent ──────────────────────────────────────
+            if agent.state.plan_mode:
+
+                def _run_plan_turn(context_msgs, task_input):
+                    """在子线程中运行 PlanAgent 一轮，返回 (plan_text, plan_file) 或抛异常。"""
+                    result_box: list = []
+                    exc_box: list[Exception] = []
+
+                    def _worker():
+                        try:
+                            result_box.append(plan_agent.run(context_msgs, task_input))
+                        except Exception as ex:
+                            exc_box.append(ex)
+
+                    t = threading.Thread(target=_worker, daemon=True)
+                    t.start()
+                    try:
+                        while t.is_alive():
+                            t.join(timeout=0.05)
+                    except KeyboardInterrupt:
+                        plan_agent._cancel.set()
+                        console.print("\n[yellow]已中断[/yellow]")
+                        t.join(timeout=2.0)
+                        return None, None, True  # cancelled
+
+                    if exc_box:
+                        raise exc_box[0]
+                    if result_box:
+                        pt, pf = result_box[0]
+                        return pt, pf, False
+                    return "", None, False
+
+                # 首轮：传入主 Agent 历史 + 用户输入
+                try:
+                    plan_text, plan_file, cancelled = _run_plan_turn(
+                        agent.state.messages, user_input
+                    )
+                except Exception as ex:
+                    console.print(f"\n[bold red]计划 Agent 错误: {ex}[/bold red]")
+                    continue
+
+                if cancelled or plan_agent._cancel.is_set():
+                    continue
+
+                print()
+
+                # Q&A 轮次：若输出含待确认问题，逐题交互后再投回 PlanAgent
+                MAX_QA = 6
+                for _ in range(MAX_QA):
+                    if not _has_plan_questions(plan_text):
+                        break  # 无问题 → 已是最终计划
+
+                    answers_text = _ask_plan_questions(plan_text, prompt_session, console)
+                    if answers_text is None:
+                        # 用户取消 → 退出计划模式
+                        cancelled = True
+                        break
+
+                    print()
+                    try:
+                        plan_text, plan_file, cancelled = _run_plan_turn([], answers_text)
+                    except Exception as ex:
+                        console.print(f"\n[bold red]计划 Agent 错误: {ex}[/bold red]")
+                        cancelled = True
+                        break
+
+                    if cancelled or plan_agent._cancel.is_set():
+                        break
+                    print()
+
+                if cancelled or plan_agent._cancel.is_set():
+                    continue
+
+                # 最终计划完成 → 展示后续选项
+                _pending_input = _handle_plan_complete(
+                    agent, plan_agent, plan_text, plan_file, console, prompt_session
+                )
+                continue
+
+            # ── 普通模式：路由到主 CodingAgent ─────────────────────────────────
             agent._cancel.clear()
             _exc: list[Exception] = []
 
@@ -918,39 +1005,15 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
             except KeyboardInterrupt:
                 agent._cancel.set()
                 console.print("\n[yellow]已中断[/yellow]")
-                # 第 1 轮：等 2s（权限确认 0.2s 内响应，通常够用）
                 t.join(timeout=2.0)
                 if t.is_alive():
-                    # 第 2 轮：HTTP socket 可能还在读，再等 8s
                     t.join(timeout=8.0)
                 if t.is_alive():
                     console.print("[yellow]警告：工作线程仍未退出，后台可能仍有网络请求[/yellow]")
             else:
                 if _exc:
                     console.print(f"\n[bold red]错误: {_exc[0]}[/bold red]")
-            print()  # 确保换行
-
-            # 计划模式：turn 结束后检测选项列表，启动交互向导
-            if (
-                agent.state.plan_mode
-                and not _exc
-                and not agent._cancel.is_set()
-                and _pending_input is None
-            ):
-                _last_text = _get_last_assistant_text(agent)
-                _questions = _parse_plan_questions(_last_text)
-                if _questions:
-                    try:
-                        _result = _run_plan_wizard(_questions, console)
-                        if _result:
-                            # 向导中用户点击「确认执行」→ 退出计划模式
-                            agent.state.plan_mode = False
-                            console.print(
-                                "[bold green]计划已确认，退出计划模式，开始执行...[/bold green]"
-                            )
-                            _pending_input = _result
-                    except Exception:
-                        pass  # 向导失败时退回普通输入
+            print()
 
     except ImportError:
         # prompt_toolkit 未安装，退回简单 input

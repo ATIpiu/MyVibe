@@ -84,10 +84,10 @@ class StructuredLogger:
         )
         icon = "✓" if success else "✗"
         color = "green" if success else "red"
-        # 显示完整结果（最多 600 字符，避免屏幕爆炸）
+        # 显示完整结果（最多 3000 字符，避免屏幕爆炸）
         display_content = full_content or summary
-        if len(display_content) > 600:
-            display_content = display_content[:600] + f"\n[dim]… 共 {len(full_content)} 字符，已截断[/dim]"
+        if len(display_content) > 3000:
+            display_content = display_content[:3000] + f"\n[dim]… 输出过长，仅显示前 3000 字符[/dim]"
         self.console.print(Panel(
             display_content or "[dim](空结果)[/dim]",
             title=f"[bold {color}]{icon} {tool_name}[/bold {color}] [dim]{elapsed_ms}ms[/dim]",
