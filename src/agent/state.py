@@ -63,13 +63,26 @@ class AgentState:
         """检查文件是否已在本会话读取过。"""
         return file_path in self.read_files
 
-    def update_usage(self, input_tokens: int, output_tokens: int, cost_usd: float = 0.0, reasoning_tokens: int = 0) -> None:
-        """累加 token 使用量和费用（含思考链 tokens）。"""
+    def update_usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: float = 0.0,
+        reasoning_tokens: int = 0,
+        update_last_response: bool = True,
+    ) -> None:
+        """累加 token 使用量和费用（含思考链 tokens）。
+
+        Args:
+            update_last_response: 为 False 时不覆盖 last_response_input_tokens，
+                                  用于子 Agent（命名等）避免干扰上下文比例计算。
+        """
         self.total_input_tokens += input_tokens
         self.total_output_tokens += output_tokens
         self.total_reasoning_tokens += reasoning_tokens
         self.total_cost_usd += cost_usd
-        self.last_response_input_tokens = input_tokens
+        if update_last_response:
+            self.last_response_input_tokens = input_tokens
 
     def to_dict(self) -> dict:
         return {

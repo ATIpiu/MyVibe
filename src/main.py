@@ -141,13 +141,27 @@ def handle_slash_command(
         return True
 
     elif cmd == "/cost":
-        table = Table(title="Token 使用统计", show_header=True)
-        table.add_column("指标", style="cyan")
+        s = agent.state
+        llm = agent.llm
+        table = Table(title="Token 使用统计", show_header=True, header_style="bold cyan")
+        table.add_column("指标", style="cyan", min_width=20)
         table.add_column("数值", justify="right")
-        table.add_row("输入 tokens", f"{agent.state.total_input_tokens:,}")
-        table.add_row("输出 tokens", f"{agent.state.total_output_tokens:,}")
-        table.add_row("总费用 (USD)", f"${agent.state.total_cost_usd:.4f}")
-        table.add_row("对话轮数", str(agent.state.turn))
+        # 会话累计（含子 Agent，从 LLMClient 读取）
+        table.add_row("[bold]本次运行合计[/bold]", "")
+        table.add_row("  输入 tokens", f"{llm.session_input_tokens:,}")
+        table.add_row("  输出 tokens", f"{llm.session_output_tokens:,}")
+        if llm.session_reasoning_tokens:
+            table.add_row("  思考链 tokens", f"{llm.session_reasoning_tokens:,}")
+        table.add_row("  费用 (CNY)", f"¥{llm.session_cost_usd:.4f}")
+        table.add_row("", "")
+        # 主 Agent 历史累计（持久化，从 state 读取）
+        table.add_row("[bold]主 Agent 历史累计[/bold]", "")
+        table.add_row("  输入 tokens", f"{s.total_input_tokens:,}")
+        table.add_row("  输出 tokens", f"{s.total_output_tokens:,}")
+        if s.total_reasoning_tokens:
+            table.add_row("  思考链 tokens", f"{s.total_reasoning_tokens:,}")
+        table.add_row("  费用 (CNY)", f"¥{s.total_cost_usd:.4f}")
+        table.add_row("  对话轮数", str(s.turn))
         console.print(table)
         return True
 
@@ -524,11 +538,11 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
             return HTML('<b>[你]</b> ')
 
         def get_toolbar():
-            """底部状态栏：显示模型、轮次、累计费用。"""
+            """底部状态栏：显示模型、轮次、累计费用（含子 Agent）。"""
             model = agent.llm.model
             turn = agent.state.turn
-            cost = agent.state.total_cost_usd
-            in_tok = agent.state.total_input_tokens
+            cost = agent.llm.session_cost_usd
+            in_tok = agent.llm.session_input_tokens
             plan = " · <ansigreen>[计划模式]</ansigreen>" if agent.state.plan_mode else ""
             return HTML(
                 f" <b>{model}</b> · Turn {turn} · "

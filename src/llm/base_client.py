@@ -125,6 +125,51 @@ class LLMClient(abc.ABC):
         # 内存中的全量历史（InputMessage + LLMResponse 交替）
         self.history: list[HistoryEntry] = []
 
+        # 当前进程运行期间所有调用的累计（含子 Agent，不持久化）
+        self.session_input_tokens: int = 0
+        self.session_output_tokens: int = 0
+        self.session_reasoning_tokens: int = 0
+        self.session_cost_usd: float = 0.0
+
+    # ── Session-level token 累计 ──────────────────────────────
+
+    def _accumulate_session(self, response: LLMResponse) -> None:
+        """将 response 的 token 用量累加到 session 统计。"""
+        self.session_input_tokens += response.usage.get("input_tokens", 0)
+        self.session_output_tokens += response.usage.get("output_tokens", 0)
+        self.session_reasoning_tokens += response.usage.get("reasoning_tokens", 0)
+        self.session_cost_usd += response.cost_usd
+
+    def add_usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        reasoning_tokens: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
+        """手动累加 token 用量（用于记录绕过 stream_chat 的隔离调用）。"""
+        self.session_input_tokens += input_tokens
+        self.session_output_tokens += output_tokens
+        self.session_reasoning_tokens += reasoning_tokens
+        self.session_cost_usd += cost_usd
+
+    def chat_isolated(
+        self,
+        messages: list[dict],
+        system: Optional[str] = None,
+    ) -> LLMResponse:
+        """隔离调用：不写入对话历史，但 token 计入 session 统计。
+
+        适用于子 Agent（如会话命名），既不污染主上下文，又能追踪开销。
+        """
+        response = self._stream_chat_impl(
+            messages=messages,
+            system=system,
+            tools=[],
+        )
+        self._accumulate_session(response)
+        return response
+
     # ── 历史收集（内部工具） ──────────────────────────────
 
     @staticmethod
@@ -238,6 +283,7 @@ class LLMClient(abc.ABC):
         )
 
         self._record_response(response)
+        self._accumulate_session(response)
         return response
 
     def chat(

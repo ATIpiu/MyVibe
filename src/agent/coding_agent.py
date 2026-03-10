@@ -431,16 +431,23 @@ class CodingAgent(BaseAgent):
 
         def _run() -> None:
             try:
-                resp = llm_ref._stream_chat_impl(
+                resp = llm_ref.chat_isolated(
                     messages=[{"role": "user", "content":
                         f"用不超过10个字为这个对话命名（只输出名称，无标点无解释）：{first_content[:300]}"}],
                     system="你是对话命名助手，只输出简洁标题，不超过10个字，无标点。",
-                    tools=[],
                 )
                 name = (resp.text_content or "").strip()[:20]
                 if name:
                     state_ref.name = name
-                    session_manager_ref.save(state_ref)
+                # 将命名子 Agent 的 token 计入会话总用量（不覆盖上下文比例基准）
+                state_ref.update_usage(
+                    input_tokens=resp.usage.get("input_tokens", 0),
+                    output_tokens=resp.usage.get("output_tokens", 0),
+                    cost_usd=resp.cost_usd,
+                    reasoning_tokens=resp.usage.get("reasoning_tokens", 0),
+                    update_last_response=False,
+                )
+                session_manager_ref.save(state_ref)
             except Exception:
                 pass
 
