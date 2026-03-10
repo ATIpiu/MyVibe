@@ -29,6 +29,15 @@ DEFAULT_AUTO_ALLOW = {
     "read_memory", "lsp_hover",
 }
 
+# 计划模式下允许使用的只读工具（禁止写入/执行类工具）
+PLAN_MODE_READONLY_TOOLS = {
+    "read_file", "search_in_file",
+    "git_status", "git_diff",
+    "read_memory", "rebuild_memory",
+    "lsp_hover", "lsp_definition",
+    "get_context_info",
+}
+
 MODEL_MAX_TOKENS = 200_000
 
 
@@ -128,7 +137,7 @@ class CodingAgent(BaseAgent):
         self._memory_manager = get_memory_manager(str(context_manager.project_root))
         set_memory_manager(self._memory_manager)
 
-        # 构建工具 schema
+        # 完整工具 schema（始终保留完整版，plan_mode 时动态过滤）
         self._tools_schema = ToolRegistry.all_tools_schema()
 
         # 中断信号：由外部（main loop）在 Ctrl+C 时 set()
@@ -170,6 +179,15 @@ class CodingAgent(BaseAgent):
         # 将系统提示词同步到 state，便于 .agent_sessions JSONL 完整记录
         self.state.system_prompt = system
 
+        # 计划模式：只开放只读工具，禁止写入/执行类操作
+        if self.state.plan_mode:
+            active_tools = [
+                t for t in self._tools_schema
+                if t["name"] in PLAN_MODE_READONLY_TOOLS
+            ]
+        else:
+            active_tools = self._tools_schema
+
         final_text = ""
         iteration = 0
         turn_total_input = 0
@@ -189,14 +207,14 @@ class CodingAgent(BaseAgent):
                 model=self.llm.model,
                 messages_count=len(self.state.messages),
                 estimated_tokens=estimated_tokens,
-                tools_count=len(self._tools_schema),
+                tools_count=len(active_tools),
             )
 
             # 流式调用 LLM
             response = self.llm.stream_chat(
                 messages=self.state.messages,
                 system=system,
-                tools=self._tools_schema,
+                tools=active_tools,
                 on_text=self._on_stream_text,
                 on_tool_start=self.logger.llm_stream_tool,
                 cancel_event=self._cancel,

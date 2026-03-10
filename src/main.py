@@ -539,11 +539,16 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
 
         def get_toolbar():
             """底部状态栏：显示模型、轮次、累计费用（含子 Agent）。"""
+            from src.agent.coding_agent import PLAN_MODE_READONLY_TOOLS
             model = agent.llm.model
             turn = agent.state.turn
             cost = agent.llm.session_cost_usd
             in_tok = agent.llm.session_input_tokens
-            plan = " · <ansigreen>[计划模式]</ansigreen>" if agent.state.plan_mode else ""
+            if agent.state.plan_mode:
+                n_tools = len(PLAN_MODE_READONLY_TOOLS)
+                plan = f" · <ansigreen>[计划模式 · {n_tools} 只读工具]</ansigreen>"
+            else:
+                plan = ""
             return HTML(
                 f" <b>{model}</b> · Turn {turn} · "
                 f"{in_tok:,} tokens · ¥{cost:.4f}{plan}"
@@ -581,6 +586,20 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
             if user_input.startswith("/"):
                 if handle_slash_command(user_input, agent, session_manager, cwd):
                     continue
+
+            # 计划模式：检测用户是否在确认计划（数字 / 确认词）
+            # 若是，自动退出计划模式，让下一轮以全量工具执行
+            if agent.state.plan_mode:
+                _stripped = user_input.strip().lower()
+                _APPROVE = {"y", "yes", "ok", "好", "好的", "是", "执行", "开始",
+                            "继续", "proceed", "go", "确认", "可以", "行"}
+                _is_approve = (
+                    _stripped in _APPROVE
+                    or (_stripped.isdigit() and int(_stripped) <= 20)
+                )
+                if _is_approve:
+                    agent.state.plan_mode = False
+                    console.print("[bold green]计划已确认，退出计划模式，开始执行...[/bold green]")
 
             # 运行 Agent（后台线程 + 主线程轮询，保证 Ctrl+C 即刻响应）
             console.print()
