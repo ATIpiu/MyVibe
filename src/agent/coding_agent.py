@@ -57,6 +57,8 @@ class PermissionManager:
         self.console = console or Console()
         # 本会话中用户选择 "always" 允许的工具
         self._always_allow: set[str] = set()
+        # 由 CodingAgent 注入，用于 Ctrl+C 时跳过 stdin 阻塞
+        self._cancel_event: Optional[threading.Event] = None
 
     def check(self, tool_name: str, args: dict) -> bool:
         """主权限检查，返回 True 表示允许执行。"""
@@ -70,7 +72,13 @@ class PermissionManager:
         return self.ask_user(tool_name, args)
 
     def ask_user(self, tool_name: str, args: dict, description: str = "") -> bool:
-        """显示 Rich 确认弹窗，等待 y/n/always。"""
+        """显示 Rich 确认弹窗，等待 y/n/always。
+        若 _cancel_event 已触发，立即拒绝，不阻塞 stdin。
+        """
+        # 已取消：快速拒绝，完全不触碰 stdin
+        if self._cancel_event and self._cancel_event.is_set():
+            return False
+
         args_preview = "\n".join(
             f"  {k}: {str(v)[:100]}" for k, v in list(args.items())[:5]
         )
@@ -85,19 +93,64 @@ class PermissionManager:
             expand=False,
         ))
 
+        answer = self._cancellable_prompt()
+        if answer is None:
+            # 取消事件触发，已打印提示
+            return False
+        if answer == "a":
+            self._always_allow.add(tool_name)
+            return True
+        return answer == "y"
+
+    def _cancellable_prompt(self) -> Optional[str]:
+        """以 0.2s 为间隔轮询 stdin，每轮检查 _cancel_event。
+
+        返回用户输入的字符（"y"/"n"/"a"），取消时返回 None。
+        在不支持 select 的环境（Windows/非 TTY）自动降级为 Prompt.ask。
+        """
+        import sys
+        import os
+
+        # Windows 或非 TTY：降级为普通阻塞 Prompt
+        try:
+            import select
+            if not hasattr(select, "select") or not os.isatty(sys.stdin.fileno()):
+                raise OSError("not a tty")
+        except OSError:
+            return self._blocking_prompt()
+
+        prompt_text = (
+            "[bold yellow]允许执行？[/bold yellow]"
+            " [dim](y=是 / n=否 / a=本会话始终允许)[/dim] "
+        )
+        self.console.print(prompt_text, end="")
+
+        try:
+            while True:
+                if self._cancel_event and self._cancel_event.is_set():
+                    self.console.print("\n[yellow](已中断，自动拒绝)[/yellow]")
+                    return None
+                ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                if ready:
+                    line = sys.stdin.readline().strip().lower()
+                    if line in ("y", "n", "a"):
+                        return line
+                    # 非法输入：默认 y
+                    return "y"
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+    def _blocking_prompt(self) -> Optional[str]:
+        """普通阻塞式 Prompt.ask（降级路径）。"""
         try:
             answer = Prompt.ask(
                 "[bold yellow]允许执行？[/bold yellow] [dim](y=是 / n=否 / a=本会话始终允许)[/dim]",
                 choices=["y", "n", "a"],
                 default="y",
             ).lower()
+            return answer
         except (EOFError, KeyboardInterrupt):
-            return False
-
-        if answer == "a":
-            self._always_allow.add(tool_name)
-            return True
-        return answer == "y"
+            return None
 
     def add_allow_rule(self, rule: str) -> None:
         """添加允许规则（工具名加入 auto_allow）。"""
@@ -144,6 +197,9 @@ class CodingAgent(BaseAgent):
         self._cancel = threading.Event()
         # 命名线程引用：退出前可 join 等待完成
         self._naming_thread: Optional[threading.Thread] = None
+
+        # 将 cancel 事件注入权限管理器，Ctrl+C 时跳过 stdin 阻塞
+        self.permission._cancel_event = self._cancel
 
     def run_turn(self, user_input: str) -> str:
         """核心 agentic 循环。

@@ -245,15 +245,20 @@ class ZhipuLLMClient(LLMClient):
             ) as r:
                 self._raise_for_api_error(r)
 
+                # index → 首块时确立的 tool_id（解决后续块 id=null 的分裂问题）
+                index_to_id: dict[int, str] = {}
+
                 for raw_line in r.iter_lines():
                     if cancel_event and cancel_event.is_set():
                         break
                     if not raw_line:
                         continue
                     line = raw_line.decode("utf-8").strip()
-                    if not line.startswith("data: "):
+                    # 兼容 "data: " 和 "data:" 两种格式
+                    if line.startswith("data:"):
+                        data_str = line[5:].strip()
+                    else:
                         continue
-                    data_str = line[6:].strip()
                     if data_str == "[DONE]":
                         break
                     try:
@@ -267,33 +272,56 @@ class ZhipuLLMClient(LLMClient):
                             f"智谱 API 流式错误 [{err.get('code', '?')}]: {err.get('message', '')}"
                         )
 
-                    choice = chunk.get("choices", [{}])[0]
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        # 可能是末尾 usage-only chunk
+                        u = chunk.get("usage")
+                        if u:
+                            usage["input_tokens"] = u.get("prompt_tokens", 0)
+                            usage["output_tokens"] = u.get("completion_tokens", 0)
+                            details = (u.get("completion_tokens_details") or {})
+                            usage["reasoning_tokens"] = details.get("reasoning_tokens", 0)
+                            prompt_details = (u.get("prompt_tokens_details") or {})
+                            usage["cached_tokens"] = prompt_details.get("cached_tokens", 0)
+                        continue
+
+                    choice = choices[0]
                     delta = choice.get("delta", {})
                     text_delta = delta.get("content")
                     if text_delta:
                         text_buffer += text_delta
-                        if on_text:
+                        # 取消后不再回调，防止乱码写入界面
+                        if on_text and not (cancel_event and cancel_event.is_set()):
                             on_text(text_delta)
 
-                    for tc in delta.get("tool_calls", []):
-                        tool_id = tc.get("id") or f"tool_{tc.get('index', 0)}"
-                        func = tc.get("function", {})
-                        if tool_id not in tool_buffers:
-                            tool_buffers[tool_id] = {"name": func.get("name", ""), "input_json": ""}
+                    for tc in delta.get("tool_calls") or []:
+                        index = tc.get("index", 0)
+                        func = tc.get("function") or {}
+                        if index not in index_to_id:
+                            # 首块：用 id 字段建立 buffer，id 缺失时用 index 兜底
+                            tool_id = tc.get("id") or f"tool_{index}"
+                            index_to_id[index] = tool_id
+                            tool_buffers[tool_id] = {
+                                "name": func.get("name") or "",
+                                "input_json": "",
+                            }
                             if on_tool_start:
                                 on_tool_start(tool_buffers[tool_id]["name"], tool_id)
-                        tool_buffers[tool_id]["input_json"] += func.get("arguments", "")
+                        else:
+                            # 后续块：id=null，通过 index 找回正确 buffer
+                            tool_id = index_to_id[index]
+                        tool_buffers[tool_id]["input_json"] += func.get("arguments") or ""
 
                     if choice.get("finish_reason"):
                         stop_reason = choice["finish_reason"]
 
-                    if "usage" in chunk:
-                        u = chunk["usage"]
+                    u = chunk.get("usage")
+                    if u:
                         usage["input_tokens"] = u.get("prompt_tokens", 0)
                         usage["output_tokens"] = u.get("completion_tokens", 0)
-                        details = u.get("completion_tokens_details", {})
+                        details = (u.get("completion_tokens_details") or {})
                         usage["reasoning_tokens"] = details.get("reasoning_tokens", 0)
-                        prompt_details = u.get("prompt_tokens_details", {})
+                        prompt_details = (u.get("prompt_tokens_details") or {})
                         usage["cached_tokens"] = prompt_details.get("cached_tokens", 0)
 
         except RuntimeError:

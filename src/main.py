@@ -620,7 +620,13 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
             except KeyboardInterrupt:
                 agent._cancel.set()
                 console.print("\n[yellow]已中断[/yellow]")
+                # 第 1 轮：等 2s（权限确认 0.2s 内响应，通常够用）
                 t.join(timeout=2.0)
+                if t.is_alive():
+                    # 第 2 轮：HTTP socket 可能还在读，再等 8s
+                    t.join(timeout=8.0)
+                if t.is_alive():
+                    console.print("[yellow]警告：工作线程仍未退出，后台可能仍有网络请求[/yellow]")
             else:
                 if _exc:
                     console.print(f"\n[bold red]错误: {_exc[0]}[/bold red]")
