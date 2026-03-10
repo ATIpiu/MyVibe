@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import uuid
@@ -518,6 +519,302 @@ def display_memory_stats(console: Console, memory_manager) -> None:
         pass
 
 
+# ─────────────────── 计划模式交互式选择器 ────────────────────
+
+_OPT_RE = re.compile(r"^\s*(\d+)[.、。]\s+(.+)")
+
+
+def _parse_plan_questions(text: str) -> list[tuple[str, list[str]]]:
+    """从 LLM 计划响应中解析所有「问题+选项」块。
+
+    返回 [(question_header, [opt1, opt2, ...]), ...]
+    header 取该编号列表前最近一条非空行，可为空字符串。
+    """
+    lines = text.split("\n")
+    results: list[tuple[str, list[str]]] = []
+    i = 0
+    while i < len(lines):
+        m = _OPT_RE.match(lines[i])
+        if m and int(m.group(1)) == 1:
+            opts = [m.group(2).strip()]
+            expected = 2
+            j = i + 1
+            while j < len(lines):
+                stripped = lines[j].strip()
+                if not stripped:
+                    j += 1
+                    continue
+                m2 = _OPT_RE.match(stripped)
+                if m2 and int(m2.group(1)) == expected:
+                    opts.append(m2.group(2).strip())
+                    expected += 1
+                    j += 1
+                else:
+                    break
+            if len(opts) >= 2:
+                # 往前找 header（跳过空行，取最近非空行，剥离 Markdown 符号）
+                header = ""
+                for k in range(i - 1, max(-1, i - 5), -1):
+                    prev = lines[k].strip()
+                    if prev:
+                        header = prev.strip("*#> ").strip()
+                        break
+                results.append((header, opts))
+                i = j
+                continue
+        i += 1
+    return results
+
+
+def _get_last_assistant_text(agent) -> str:
+    """从 agent.state.messages 取最后一条 assistant 消息的文本内容。"""
+    for msg in reversed(agent.state.messages):
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "\n".join(
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+    return ""
+
+
+def _select_one_question(
+    q_idx: int,
+    q_total: int,
+    header: str,
+    options: list[str],
+    default_idx: int,
+    console: Console,
+) -> "int | str":
+    """用 prompt_toolkit Application 渲染单题选择器。
+
+    返回选中的选项下标（int），或自定义文本（str）。
+    """
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.formatted_text import HTML
+
+    CUSTOM_FLAG = any(kw in options[-1] for kw in ("自定义", "custom", "其他"))
+    sel = [max(0, min(default_idx, len(options) - 1))]
+
+    def get_text():
+        rows: list[str] = []
+        title = f"问题 {q_idx + 1}/{q_total}"
+        if header:
+            title += f"：{header}"
+        rows.append(f"<ansicyan><b> {title} </b></ansicyan>")
+        rows.append("")
+        for i, opt in enumerate(options):
+            label = opt[:72] + "…" if len(opt) > 72 else opt
+            label = label.replace("<", "&lt;").replace(">", "&gt;")
+            if i == sel[0]:
+                rows.append(f"  <reverse><b> {i + 1}. {label} </b></reverse>")
+            else:
+                rows.append(f"     <dim>{i + 1}.</dim> {label}")
+        rows.append("")
+        rows.append(
+            "<ansiblue> ↑/↓</ansiblue> 导航  "
+            "<ansiblue>1-9</ansiblue> 快速选择  "
+            "<ansiblue>Enter</ansiblue> 确认"
+        )
+        return HTML("\n".join(rows))
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(e):
+        sel[0] = (sel[0] - 1) % len(options)
+
+    @kb.add("down")
+    def _(e):
+        sel[0] = (sel[0] + 1) % len(options)
+
+    @kb.add("enter")
+    def _(e):
+        e.app.exit(result=sel[0])
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _(e):
+        e.app.exit(result=-1)
+
+    for n in range(1, min(len(options) + 1, 10)):
+        @kb.add(str(n))
+        def _(e, _n=n - 1):
+            sel[0] = _n
+            e.app.exit(result=_n)
+
+    app = Application(
+        layout=Layout(Window(content=FormattedTextControl(get_text, focusable=True))),
+        key_bindings=kb,
+        full_screen=False,
+        mouse_support=False,
+    )
+    idx: int = app.run()
+    if idx == -1:
+        return default_idx  # ESC：保持默认
+
+    if CUSTOM_FLAG and idx == len(options) - 1:
+        console.print("[dim]请输入自定义内容：[/dim]")
+        try:
+            from prompt_toolkit import prompt as _pt_prompt
+            custom = _pt_prompt("  > ").strip()
+            return custom if custom else idx
+        except Exception:
+            return idx
+
+    return idx
+
+
+def _show_review(
+    questions: list[tuple[str, list[str]]],
+    selections: list,
+    console: Console,
+) -> "tuple[bool, int | None]":
+    """汇总确认屏：显示所有选择，支持回头重选。
+
+    返回 (confirmed, redo_idx)：
+      - (True,  None)  → 确认执行
+      - (False, N)     → 重新选择第 N 题
+      - (False, None)  → 取消
+    """
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.formatted_text import HTML
+
+    # cursor：0..len-1 对应每道题，len 对应"确认执行"按钮
+    cursor = [len(questions)]
+
+    def sel_text(i: int) -> str:
+        s = selections[i]
+        _, opts = questions[i]
+        if isinstance(s, str):
+            return s
+        return f"{s + 1}. {opts[s]}"
+
+    def get_text():
+        rows: list[str] = []
+        rows.append("<ansicyan><b> ── 确认选择 ── </b></ansicyan>")
+        rows.append("")
+        for i, (hdr, _) in enumerate(questions):
+            title = hdr[:50] + "…" if len(hdr) > 50 else hdr
+            title = title.replace("<", "&lt;").replace(">", "&gt;")
+            desc = sel_text(i)
+            desc_safe = (desc[:65] + "…" if len(desc) > 65 else desc).replace("<", "&lt;").replace(">", "&gt;")
+            if cursor[0] == i:
+                rows.append(
+                    f"  <reverse><b> Q{i + 1}. {title or f'问题{i+1}'} </b></reverse>"
+                    f"  <dim>Enter 重选</dim>"
+                )
+                rows.append(f"     → <ansiyellow>{desc_safe}</ansiyellow>")
+            else:
+                rows.append(f"  <ansigreen>✓</ansigreen> Q{i + 1}. {title or f'问题{i+1}'}")
+                rows.append(f"     → <dim>{desc_safe}</dim>")
+            rows.append("")
+        # 确认按钮
+        if cursor[0] == len(questions):
+            rows.append("  <reverse><b> ✓  确认执行 </b></reverse>")
+        else:
+            rows.append("  <ansiblue>[ ✓ 确认执行 ]</ansiblue>")
+        rows.append("")
+        rows.append(
+            "<ansiblue> ↑/↓</ansiblue> 导航  "
+            "<ansiblue>Enter</ansiblue> 确认/重选  "
+            "<ansiblue>Esc</ansiblue> 取消"
+        )
+        return HTML("\n".join(rows))
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(e):
+        cursor[0] = max(0, cursor[0] - 1)
+
+    @kb.add("down")
+    def _(e):
+        cursor[0] = min(len(questions), cursor[0] + 1)
+
+    @kb.add("enter")
+    def _(e):
+        if cursor[0] == len(questions):
+            e.app.exit(result=("confirm", None))
+        else:
+            e.app.exit(result=("reselect", cursor[0]))
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _(e):
+        e.app.exit(result=("cancel", None))
+
+    app = Application(
+        layout=Layout(Window(content=FormattedTextControl(get_text, focusable=True))),
+        key_bindings=kb,
+        full_screen=False,
+        mouse_support=False,
+    )
+    action, idx = app.run()
+    if action == "confirm":
+        return True, None
+    if action == "reselect":
+        return False, idx
+    return False, None
+
+
+def _run_plan_wizard(
+    questions: list[tuple[str, list[str]]],
+    console: Console,
+) -> "str | None":
+    """多问题计划向导：依次选题 → 汇总确认（可回头重选） → 返回组合消息。
+
+    返回 None 表示用户取消。
+    """
+    if not questions:
+        return None
+
+    selections: list = [0] * len(questions)
+
+    # 第一轮：依次选每道题
+    for i, (header, options) in enumerate(questions):
+        sel = _select_one_question(i, len(questions), header, options, 0, console)
+        selections[i] = sel
+
+    # 确认循环：可回头重选
+    while True:
+        confirmed, redo_idx = _show_review(questions, selections, console)
+        if confirmed:
+            break
+        if redo_idx is None:
+            return None  # 用户取消
+        # 重选指定题
+        header, options = questions[redo_idx]
+        cur = selections[redo_idx] if isinstance(selections[redo_idx], int) else 0
+        selections[redo_idx] = _select_one_question(
+            redo_idx, len(questions), header, options, cur, console
+        )
+
+    # 组合发送给 LLM 的消息
+    parts: list[str] = []
+    for i, ((header, options), sel) in enumerate(zip(questions, selections)):
+        q_label = header[:30] if header else f"问题{i + 1}"
+        if isinstance(sel, str):
+            parts.append(f"Q{i + 1}（{q_label}）：{sel}")
+        else:
+            parts.append(f"Q{i + 1}（{q_label}）：{sel + 1}. {options[sel]}")
+    return "\n".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────
+
 def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cwd: str = ".") -> None:
     """主交互循环。"""
     try:
@@ -572,9 +869,15 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
             bottom_toolbar=get_toolbar,
         )
 
+        _pending_input: Optional[str] = None
+
         while True:
             try:
-                user_input = prompt_session.prompt(get_prompt).strip()
+                if _pending_input is not None:
+                    user_input = _pending_input
+                    _pending_input = None
+                else:
+                    user_input = prompt_session.prompt(get_prompt).strip()
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[dim]再见！[/dim]")
                 break
@@ -587,17 +890,12 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
                 if handle_slash_command(user_input, agent, session_manager, cwd):
                     continue
 
-            # 计划模式：检测用户是否在确认计划（数字 / 确认词）
-            # 若是，自动退出计划模式，让下一轮以全量工具执行
+            # 计划模式：手动输入确认词时退出（向导路径已在 turn 后自动处理）
             if agent.state.plan_mode:
                 _stripped = user_input.strip().lower()
                 _APPROVE = {"y", "yes", "ok", "好", "好的", "是", "执行", "开始",
                             "继续", "proceed", "go", "确认", "可以", "行"}
-                _is_approve = (
-                    _stripped in _APPROVE
-                    or (_stripped.isdigit() and int(_stripped) <= 20)
-                )
-                if _is_approve:
+                if _stripped in _APPROVE:
                     agent.state.plan_mode = False
                     console.print("[bold green]计划已确认，退出计划模式，开始执行...[/bold green]")
 
@@ -631,6 +929,28 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
                 if _exc:
                     console.print(f"\n[bold red]错误: {_exc[0]}[/bold red]")
             print()  # 确保换行
+
+            # 计划模式：turn 结束后检测选项列表，启动交互向导
+            if (
+                agent.state.plan_mode
+                and not _exc
+                and not agent._cancel.is_set()
+                and _pending_input is None
+            ):
+                _last_text = _get_last_assistant_text(agent)
+                _questions = _parse_plan_questions(_last_text)
+                if _questions:
+                    try:
+                        _result = _run_plan_wizard(_questions, console)
+                        if _result:
+                            # 向导中用户点击「确认执行」→ 退出计划模式
+                            agent.state.plan_mode = False
+                            console.print(
+                                "[bold green]计划已确认，退出计划模式，开始执行...[/bold green]"
+                            )
+                            _pending_input = _result
+                    except Exception:
+                        pass  # 向导失败时退回普通输入
 
     except ImportError:
         # prompt_toolkit 未安装，退回简单 input
