@@ -111,7 +111,11 @@ class PermissionManager:
         import sys
         import os
 
-        # Windows 或非 TTY：降级为普通阻塞 Prompt
+        # Windows：select.select 仅支持 socket，不支持 stdin fd，直接降级
+        if sys.platform == "win32":
+            return self._blocking_prompt()
+
+        # 非 TTY：降级为普通阻塞 Prompt
         try:
             import select
             if not hasattr(select, "select") or not os.isatty(sys.stdin.fileno()):
