@@ -1,56 +1,66 @@
-"""项目初始化：首次运行时生成 MyVibe.md 项目记忆文件。
+"""项目初始化：/init 命令由主 CodingAgent 主动探索项目后生成 MyVibe.md。
 
 MyVibe.md 是项目维度的记忆，类似 Claude Code 的 CLAUDE.md：
-- 由 AI 首次自动生成，用户可手动编辑
+- 由 AI 通过工具调用自动生成，用户可手动编辑
 - 每次对话开始时自动注入系统提示词
-- 记录项目简介、技术栈、约定、常用命令等
+- 记录项目架构、模块职责、技术栈、约定、常用命令等
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from ..llm.client import LLMClient
 
 MYVIBE_FILENAME = "MyVibe.md"
 
-_README_NAMES = [
-    "README.md", "README.rst", "README.txt",
-    "readme.md", "Readme.md", "README",
-]
+# 指示 CodingAgent 主动探索项目并写入 MyVibe.md 的 prompt
+_INIT_AGENT_PROMPT = """\
+请对当前项目进行全面的架构分析，然后用 write_file 工具将结果写入 {myvibe_path}。
 
-_GENERATE_PROMPT = """\
-你是一个项目分析助手。请根据以下项目信息，生成一个 MyVibe.md 项目记忆文件。
+## 分析步骤（请按顺序执行）
 
-项目路径：{cwd}
+1. `read_memory(scope='all')` — 获取所有模块与函数索引，了解项目全貌
+2. 读取项目配置文件：`pyproject.toml` / `setup.py` / `requirements.txt` / `config/` 目录等
+3. 如有 README，读取它
+4. 读取主入口文件（如 `main.py`、`__main__.py`、`app.py`、`src/main.py` 等）
+5. 对核心模块用 `read_memory(scope='module', module_path=...)` 深入了解其职责
+6. 通过 `git_log` / `git_status` 了解版本与近期改动
 
-{project_info}
+## MyVibe.md 写入要求
 
-请用中文生成结构清晰的 MyVibe.md，严格按照以下模板，未知信息留空或省略整个小节：
+内容**必须真实反映项目现状**，覆盖以下章节（未知或不适用的可省略）：
 
+```markdown
 # 项目记忆
 
 ## 项目简介
-（一句话描述项目的用途和目标）
+（一句话描述：这是什么，解决什么问题）
+
+## 整体架构
+（描述各层/子系统的分工，核心模块间的依赖关系与数据流向，
+ 尽量用列表或短段落说清楚"谁调用谁、数据怎么流"）
+
+## 模块说明
+（每个模块/目录一行，格式：`路径` — 职责 · 核心类/函数）
 
 ## 技术栈
-（主要编程语言、框架、关键依赖）
+（语言版本、主要框架/库及其用途）
 
-## 项目结构
-（关键目录和文件的说明，保持简洁）
+## 入口与启动流程
+（如何运行，主入口在哪，启动时发生了什么）
 
 ## 重要约定
-（编码规范、命名规则、架构决策、需要注意的规则）
+（编码规范、架构决策、命名规则、必须遵守的约束）
 
 ## 常用命令
-（如何运行、测试、构建、调试项目）
+（运行、测试、构建、调试命令）
 
 ## 注意事项
 （已知问题、特殊限制、开发陷阱）
 
 ---
 *此文件由 AI 自动生成，可手动编辑。每次对话开始时自动加载为项目上下文。*
+```
+
+完成分析后，**直接调用 write_file 写入文件，不要询问用户确认**。
 """
 
 
@@ -70,100 +80,14 @@ def load_myvibe(cwd: str) -> str:
         return ""
 
 
-def _find_readme(cwd: str) -> Optional[str]:
-    """查找并读取 README 文件，返回内容（最多 5000 字符）。"""
-    for name in _README_NAMES:
-        path = Path(cwd) / name
-        if path.exists() and path.is_file():
-            try:
-                return path.read_text(encoding="utf-8", errors="replace")[:5000]
-            except OSError:
-                pass
-    return None
-
-
-def _build_project_info(cwd: str, memory_manager) -> str:
-    """收集项目信息：优先 README，其次记忆模块扫描结果。"""
-    readme = _find_readme(cwd)
-    if readme:
-        return f"## README 内容\n\n{readme}"
-
-    # 没有 README → 用记忆模块扫描项目结构
-    try:
-        memory_manager.sync()
-        all_memory = memory_manager.read_all()
-        if not all_memory:
-            return ""
-
-        lines = [f"## 项目代码结构（共 {len(all_memory)} 个模块）\n"]
-        for mod_path, mod_data in sorted(all_memory.items()):
-            func_names = list(mod_data.functions.keys())[:6]
-            func_str = ", ".join(func_names)
-            if len(mod_data.functions) > 6:
-                func_str += f" 等 {len(mod_data.functions)} 个"
-            desc = f"  —  {mod_data.purpose}" if mod_data.purpose else ""
-            lines.append(f"- `{mod_path}`{desc}  [{func_str}]")
-        return "\n".join(lines)
-    except Exception:
-        return ""
-
-
-def initialize_project(
-    llm_client: "LLMClient",
-    memory_manager,
-    cwd: str,
-    console,
-) -> bool:
-    """首次运行时初始化项目记忆，生成 MyVibe.md。
-
-    Args:
-        llm_client: LLM 客户端（用于生成文件内容）
-        memory_manager: 记忆管理器（无 README 时用于扫描项目）
-        cwd: 项目根目录
-        console: Rich Console 实例（用于打印进度）
+def get_init_prompt(cwd: str) -> "tuple[bool, str]":
+    """检查是否需要初始化，并返回发给 Agent 的 prompt。
 
     Returns:
-        True 表示新生成了 MyVibe.md，False 表示已存在跳过。
+        (already_exists, prompt_str)
+        already_exists=True 表示 MyVibe.md 已存在，prompt_str 为空。
     """
     path = myvibe_path(cwd)
     if path.exists():
-        return False  # 已存在，无需初始化
-
-    console.print("\n[bold cyan]首次运行，正在初始化项目记忆...[/bold cyan]")
-
-    # 收集项目信息
-    readme = _find_readme(cwd)
-    if readme:
-        console.print("[dim]  已找到 README，作为项目信息来源[/dim]")
-        project_info = f"## README 内容\n\n{readme}"
-    else:
-        console.print("[dim]  未找到 README，正在扫描代码结构...[/dim]")
-        project_info = _build_project_info(cwd, memory_manager)
-        if not project_info:
-            console.print("[dim]  代码结构扫描完成（暂无函数记录）[/dim]")
-
-    # 用 LLM 生成 MyVibe.md
-    console.print("[dim]  正在生成 MyVibe.md...[/dim]")
-    prompt = _GENERATE_PROMPT.format(
-        cwd=cwd,
-        project_info=project_info or "（项目信息暂时不可用，请根据项目路径推断）",
-    )
-
-    try:
-        response = llm_client.stream_chat(
-            messages=[{"role": "user", "content": prompt}],
-            system="你是一个专业的项目文档助手。请生成简洁、实用的项目记忆文件，用中文，内容真实可信。",
-            tools=[],
-        )
-        content = response.text_content
-        if content and content.strip():
-            path.write_text(content.strip() + "\n", encoding="utf-8")
-            console.print(f"[green]✓ 已生成 {MYVIBE_FILENAME}（位于 {path}）[/green]")
-            console.print("[dim]  你可以随时编辑此文件来更新项目记忆。[/dim]")
-            return True
-        else:
-            console.print("[yellow]  LLM 未返回内容，跳过生成[/yellow]")
-    except Exception as e:
-        console.print(f"[yellow]  生成 MyVibe.md 失败：{e}[/yellow]")
-
-    return False
+        return True, ""
+    return False, _INIT_AGENT_PROMPT.format(myvibe_path=str(path))

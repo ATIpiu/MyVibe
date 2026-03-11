@@ -112,6 +112,7 @@ def handle_slash_command(
     agent: CodingAgent,
     session_manager: SessionManager,
     cwd: str = ".",
+    _pending_box: "Optional[list]" = None,
 ) -> bool:
     """处理斜杠命令。
 
@@ -287,11 +288,14 @@ def handle_slash_command(
         return True
 
     elif cmd == "/init":
-        from src.agent.project_init import initialize_project
-        console.print("[dim]正在初始化项目记忆（MyVibe.md）...[/dim]")
-        did_generate = initialize_project(agent.llm, agent._memory_manager, cwd, console)
-        if not did_generate:
+        from src.agent.project_init import get_init_prompt
+        already_exists, init_prompt = get_init_prompt(cwd)
+        if already_exists:
             console.print("[dim]MyVibe.md 已存在，跳过生成。如需重新生成请先删除该文件。[/dim]")
+        elif _pending_box is not None:
+            # 把 init prompt 推入 pending_box，由主循环在后台线程执行，避免主线程死锁
+            console.print("[bold cyan]正在初始化项目记忆，Agent 将主动探索项目结构...[/bold cyan]")
+            _pending_box.append(init_prompt)
         display_memory_stats(console, agent._memory_manager)
         return True
 
@@ -301,8 +305,6 @@ def handle_slash_command(
 
     elif cmd == "/plan":
         agent.state.plan_mode = not agent.state.plan_mode
-        status = "开启" if agent.state.plan_mode else "关闭"
-        console.print(f"[bold green]计划模式已{status}[/bold green]")
         return True
 
     elif cmd == "/help":
@@ -865,10 +867,8 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
         @kb.add("c-p")
         def toggle_plan_mode(event):
             agent.state.plan_mode = not agent.state.plan_mode
-            status = "开启" if agent.state.plan_mode else "关闭"
             if agent.state.plan_mode:
                 plan_agent.reset()
-            console.print(f"[bold green]计划模式已{status}[/bold green]")
             event.app.invalidate()
 
         prompt_session = PromptSession(
@@ -899,11 +899,15 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
 
             # 处理斜杠命令
             _plan_mode_before = agent.state.plan_mode
+            _cmd_pending: list = []
             if user_input.startswith("/"):
-                if handle_slash_command(user_input, agent, session_manager, cwd):
+                if handle_slash_command(user_input, agent, session_manager, cwd, _cmd_pending):
                     # /plan 命令开启计划模式时重置 plan_agent
                     if agent.state.plan_mode and not _plan_mode_before:
                         plan_agent.reset()
+                    # /init 等命令可能推入待执行 prompt（在后台线程里跑，避免主线程死锁）
+                    if _cmd_pending:
+                        _pending_input = _cmd_pending[0]
                     continue
 
             console.print()

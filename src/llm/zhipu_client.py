@@ -224,6 +224,7 @@ class ZhipuLLMClient(LLMClient):
         if tools:
             payload["tools"] = _to_openai_tools(tools)
             payload["tool_choice"] = "auto"
+            payload["parallel_tool_calls"] = False  # 每次只返回一个工具调用，串行执行
 
         text_buffer = ""
         tool_buffers: dict[str, dict] = {}
@@ -371,6 +372,7 @@ class ZhipuLLMClient(LLMClient):
         if tools:
             payload["tools"] = _to_openai_tools(tools)
             payload["tool_choice"] = "auto"
+            payload["parallel_tool_calls"] = False  # 每次只返回一个工具调用，串行执行
 
         try:
             r = requests.post(

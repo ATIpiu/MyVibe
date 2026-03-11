@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -171,10 +170,10 @@ class PlanAgent:
         return final_text, plan_file
 
     def _execute_tools(self, tool_calls: list[ToolCall]) -> list[dict]:
-        """并行执行只读工具，自动允许，无权限弹窗。"""
-        results: list[Optional[dict]] = [None] * len(tool_calls)
+        """串行执行只读工具，自动允许，无权限弹窗。"""
+        results: list[dict] = []
 
-        def _run_one(idx: int, tc: ToolCall) -> tuple[int, dict]:
+        for tc in tool_calls:
             self._render_tool_call(tc.name, tc.input)
             try:
                 tool = ToolRegistry.instantiate(tc.name)
@@ -185,20 +184,14 @@ class PlanAgent:
                 content = f"工具执行异常: {e}"
                 is_error = True
 
-            return idx, {
+            results.append({
                 "type": "tool_result",
                 "tool_use_id": tc.tool_use_id,
                 "content": content,
                 "is_error": is_error,
-            }
+            })
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {executor.submit(_run_one, i, tc): i for i, tc in enumerate(tool_calls)}
-            for future in as_completed(futures):
-                idx, result = future.result()
-                results[idx] = result
-
-        return results  # type: ignore[return-value]
+        return results
 
     def _on_text(self, delta: str) -> None:
         print(delta, end="", flush=True)

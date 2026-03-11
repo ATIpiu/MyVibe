@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from rich.console import Console
@@ -50,6 +49,8 @@ class PermissionManager:
         self._always_allow: set[str] = set()
         # 由 CodingAgent 注入，用于 Ctrl+C 时跳过 stdin 阻塞
         self._cancel_event: Optional[threading.Event] = None
+        # 串行化权限弹窗：并行工具调用时只允许一个提示同时占用 stdin
+        self._prompt_lock = threading.Lock()
 
     def check(self, tool_name: str, args: dict) -> bool:
         """主权限检查，返回 True 表示允许执行。"""
@@ -65,33 +66,39 @@ class PermissionManager:
     def ask_user(self, tool_name: str, args: dict, description: str = "") -> bool:
         """显示 Rich 确认弹窗，等待 y/n/always。
         若 _cancel_event 已触发，立即拒绝，不阻塞 stdin。
+        使用 _prompt_lock 串行化，确保并行工具调用时不会多个弹窗同时抢 stdin。
         """
         # 已取消：快速拒绝，完全不触碰 stdin
         if self._cancel_event and self._cancel_event.is_set():
             return False
 
-        args_preview = "\n".join(
-            f"  {k}: {str(v)[:100]}" for k, v in list(args.items())[:5]
-        )
-        panel_content = args_preview or "(无参数)"
-        if description:
-            panel_content = f"{description}\n\n{panel_content}"
+        with self._prompt_lock:
+            # 拿到锁后再次检查取消状态（等锁期间可能已经 Ctrl+C）
+            if self._cancel_event and self._cancel_event.is_set():
+                return False
 
-        self.console.print(Panel(
-            panel_content,
-            title=f"[bold yellow]权限确认: {tool_name}[/bold yellow]",
-            border_style="yellow",
-            expand=False,
-        ))
+            args_preview = "\n".join(
+                f"  {k}: {str(v)[:100]}" for k, v in list(args.items())[:5]
+            )
+            panel_content = args_preview or "(无参数)"
+            if description:
+                panel_content = f"{description}\n\n{panel_content}"
 
-        answer = self._cancellable_prompt()
-        if answer is None:
-            # 取消事件触发，已打印提示
-            return False
-        if answer == "a":
-            self._always_allow.add(tool_name)
-            return True
-        return answer == "y"
+            self.console.print(Panel(
+                panel_content,
+                title=f"[bold yellow]权限确认: {tool_name}[/bold yellow]",
+                border_style="yellow",
+                expand=False,
+            ))
+
+            answer = self._cancellable_prompt()
+            if answer is None:
+                # 取消事件触发，已打印提示
+                return False
+            if answer == "a":
+                self._always_allow.add(tool_name)
+                return True
+            return answer == "y"
 
     def _cancellable_prompt(self) -> Optional[str]:
         """以 0.2s 为间隔轮询 stdin，每轮检查 _cancel_event。
@@ -174,7 +181,6 @@ class CodingAgent(BaseAgent):
         self.logger = logger
         self.console = console
         self.config = config
-        self.max_tool_workers = config.get("agent", {}).get("max_tool_workers", 4)
         self.compress_threshold = config.get("agent", {}).get("context_compress_threshold", 0.92)
         self.compress_keep_recent = config.get("agent", {}).get("compress_keep_recent", 10)
 
@@ -334,7 +340,7 @@ class CodingAgent(BaseAgent):
         return final_text
 
     def handle_tool_calls(self, tool_calls: list[ToolCall]) -> list[dict]:
-        """并行执行工具调用（ThreadPoolExecutor，max_workers=4）。"""
+        """串行执行工具调用（配合 parallel_tool_calls=False，每次只有一个工具）。"""
         results = [None] * len(tool_calls)
 
         def execute_one(idx: int, tc: ToolCall) -> tuple[int, dict]:
@@ -431,11 +437,9 @@ class CodingAgent(BaseAgent):
                     "is_error": True,
                 }
 
-        with ThreadPoolExecutor(max_workers=self.max_tool_workers) as executor:
-            futures = {executor.submit(execute_one, i, tc): i for i, tc in enumerate(tool_calls)}
-            for future in as_completed(futures):
-                idx, result = future.result()
-                results[idx] = result
+        for i, tc in enumerate(tool_calls):
+            idx, result = execute_one(i, tc)
+            results[idx] = result
 
         return results
 

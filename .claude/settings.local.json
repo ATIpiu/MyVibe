@@ -4,7 +4,9 @@
       "Bash(python:*)",
       "Bash(pip install:*)",
       "Bash(\"C:\\\\Users\\\\15227\\\\PycharmProjects\\\\MyVibe\\\\ai_coding_agent\\\\src\\\\completer\\\\__init__.py\":*)",
-      "Bash(git check-ignore:*)"
+      "Bash(git check-ignore:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }
