@@ -417,6 +417,43 @@ class CodingAgent(BaseAgent):
 
             self.logger.permission_check(tool_name, "execute", True)
 
+            # ── shell 工具：流式输出 + 实时可折叠面板 ────────────────
+            if tool_name == "shell":
+                from ..ui.collapsible_output import CollapsibleOutput
+                from ..ui.key_listener import CtrlOListener
+
+                co = CollapsibleOutput(
+                    self.console,
+                    title=f"[bold cyan]⚡ shell[/bold cyan]",
+                    border_style="cyan",
+                    interactive=True,
+                )
+                try:
+                    shell_tool = ToolRegistry.instantiate("shell")
+                    with co:
+                        with CtrlOListener(co.toggle):
+                            result = shell_tool.execute_stream(
+                                command=args.get("command", ""),
+                                on_line=co.feed,
+                                timeout=args.get("timeout", 120000),
+                                working_dir=args.get("working_dir"),
+                            )
+                        co.finish()
+                except Exception as e:
+                    from ..tools.base_tool import ToolResult as _TR
+                    result = _TR(content=f"shell 执行异常: {e}", is_error=True)
+
+                # 用成功/失败颜色更新显示已通过 Live 完成，仅记录日志
+                elapsed = int(time.monotonic() * 1000) - start_ms
+                full_content = result.content or ""
+                summary = full_content[:80].replace("\n", " ")
+                self.logger.tool_result(
+                    tool_name, tool_use_id, not result.is_error,
+                    summary, elapsed, full_content,
+                    pre_rendered=True,
+                )
+                return idx, result.to_api_dict(tool_use_id)
+
             # 已读文件拦截：避免重复 read_file，节省 token
             if tool_name == "read_file":
                 file_path = args.get("file_path", "")

@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
 import sys
-from typing import Optional
+from typing import Callable, Optional
 
 from .base_tool import BaseTool, ToolRegistry, ToolResult
 
@@ -175,6 +176,103 @@ class ShellTool(BaseTool):
         if result.returncode != 0:
             return ToolResult(
                 content=f"[退出码 {result.returncode}]\n{combined}",
+                is_error=True,
+            )
+
+        return ToolResult(content=combined or "(无输出)")
+
+    def execute_stream(
+        self,
+        command: str,
+        on_line: Callable[[str], None],
+        timeout: int = 120000,
+        working_dir: Optional[str] = None,
+    ) -> ToolResult:
+        """执行命令并实时回调每一行输出（用于 CollapsibleOutput 流式显示）。
+
+        Args:
+            command: Shell 命令
+            on_line: 每次产生一行（含换行符）时的回调
+            timeout: 超时毫秒数
+            working_dir: 工作目录
+        """
+        if check_shell_injection(command):
+            return ToolResult(
+                content="命令包含 Shell 注入特征（反引号或 $() 嵌套），已拒绝执行",
+                is_error=True,
+            )
+
+        danger = classify_command_danger(command, self.dangerous_patterns)
+        if danger == "deny":
+            return ToolResult(
+                content=f"命令被永久拒绝执行（高危操作）: {command}",
+                is_error=True,
+            )
+
+        timeout_sec = timeout / 1000.0
+        cwd = working_dir or self.cwd
+
+        try:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=cwd,
+            )
+        except Exception as e:
+            return ToolResult(content=f"命令启动异常: {e}", is_error=True)
+
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+
+        def _read(stream: object, dest: list[str], prefix: str) -> None:
+            for raw in iter(stream.readline, b""):  # type: ignore[attr-defined]
+                line = _decode_output(raw).rstrip("\r\n")
+                dest.append(line)
+                on_line(prefix + line + "\n")
+            stream.close()  # type: ignore[attr-defined]
+
+        t_out = threading.Thread(
+            target=_read, args=(proc.stdout, stdout_lines, ""), daemon=True
+        )
+        t_err = threading.Thread(
+            target=_read, args=(proc.stderr, stderr_lines, "[stderr] "), daemon=True
+        )
+        t_out.start()
+        t_err.start()
+
+        timed_out = False
+        t_out.join(timeout=timeout_sec)
+        if t_out.is_alive():
+            proc.kill()
+            timed_out = True
+        t_err.join(timeout=0.5)
+        try:
+            rc = proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            rc = -1
+
+        if timed_out:
+            return ToolResult(
+                content=f"命令超时（{timeout_sec:.0f}秒）: {command}",
+                is_error=True,
+            )
+
+        MAX_OUTPUT = 10000
+        combined = "\n".join(stdout_lines)
+        if stderr_lines:
+            combined += "\n[stderr]\n" + "\n".join(stderr_lines)
+
+        if len(combined) > MAX_OUTPUT:
+            combined = (
+                combined[:MAX_OUTPUT]
+                + f"\n... [输出已截断，原始长度 {len(combined)} 字符]"
+            )
+
+        if rc != 0:
+            return ToolResult(
+                content=f"[退出码 {rc}]\n{combined}",
                 is_error=True,
             )
 

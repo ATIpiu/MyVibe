@@ -77,23 +77,40 @@ class StructuredLogger:
         summary: str,
         elapsed_ms: int,
         full_content: str = "",
+        pre_rendered: bool = False,
     ) -> None:
+        """渲染工具结果。
+
+        Args:
+            pre_rendered: 为 True 时跳过渲染（已由 CollapsibleOutput 流式显示过，
+                          如 shell 工具）。仍会记录结构化日志。
+        """
         self.log(
             LogEvent.TOOL_RESULT,
             {"tool_name": tool_name, "tool_use_id": tool_use_id, "success": success, "summary": summary, "elapsed_ms": elapsed_ms},
         )
+        if pre_rendered:
+            return
+
+        from ..ui.collapsible_output import CollapsibleOutput
+
         icon = "✓" if success else "✗"
         color = "green" if success else "red"
-        # 显示完整结果（最多 3000 字符，避免屏幕爆炸）
         display_content = full_content or summary
         if len(display_content) > 3000:
-            display_content = display_content[:3000] + f"\n[dim]… 输出过长，仅显示前 3000 字符[/dim]"
-        self.console.print(Panel(
-            display_content or "[dim](空结果)[/dim]",
+            display_content = (
+                display_content[:3000]
+                + f"\n[dim]… 输出过长，仅显示前 3000 字符[/dim]"
+            )
+
+        co = CollapsibleOutput(
+            self.console,
             title=f"[bold {color}]{icon} {tool_name}[/bold {color}] [dim]{elapsed_ms}ms[/dim]",
             border_style=color,
-            expand=False,
-        ))
+            interactive=False,
+        )
+        co.feed(display_content or "(空结果)")
+        co.print_static()
 
     def tool_error(self, tool_name: str, tool_use_id: str, error: Exception) -> None:
         tb = traceback.format_exc()
