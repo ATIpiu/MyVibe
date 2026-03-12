@@ -16,7 +16,7 @@ from ..context.context_manager import ContextManager
 from ..llm.client import LLMClient, ToolCall
 from ..llm.prompts import build_system_prompt, build_tool_descriptions
 from ..logger.structured_logger import StructuredLogger
-from ..tools.base_tool import ToolRegistry
+from ..tools.base_tool import ToolRegistry, ToolResult
 from ..tools.context_tools import set_context_manager
 from ..tools.memory_tools import set_memory_manager
 from ..tools.git import auto_commit_turn
@@ -192,7 +192,9 @@ class CodingAgent(BaseAgent):
         set_memory_manager(self._memory_manager)
 
         # 完整工具 schema（始终保留完整版，plan_mode 时动态过滤）
-        self._tools_schema = ToolRegistry.all_tools_schema()
+        # 追加 spawn_agent（不通过 ToolRegistry，由 handle_tool_calls 特殊处理）
+        from ..tools.agent_tools import SPAWN_AGENT_SCHEMA
+        self._tools_schema = ToolRegistry.all_tools_schema() + [SPAWN_AGENT_SCHEMA]
 
         # 中断信号：由外部（main loop）在 Ctrl+C 时 set()
         self._cancel = threading.Event()
@@ -223,6 +225,21 @@ class CodingAgent(BaseAgent):
         self.logger.turn_start(self.state.turn, user_input)
 
         self.check_compress()
+
+        # 模型路由：若配置启用则按任务类型动态切换模型
+        _original_model: str | None = None
+        if self.config.get("agent", {}).get("model_routing", False):
+            try:
+                from ..llm.model_router import route_model
+                cfg = route_model(self.state.messages)
+                if self.llm.model != cfg.model_id:
+                    _original_model = self.llm.model
+                    self.llm.model = cfg.model_id
+                    self.console.print(
+                        f"[dim]→ 路由模型: {cfg.model_id}（{cfg.description}）[/dim]"
+                    )
+            except Exception:
+                pass
 
         system = self._system
         active_tools = self._tools_schema
@@ -337,6 +354,10 @@ class CodingAgent(BaseAgent):
             if commit_hash:
                 self.logger.log("git_auto_commit", {"turn": self.state.turn, "hash": commit_hash})
 
+        # 恢复原始模型（路由仅作用于本轮）
+        if _original_model is not None:
+            self.llm.model = _original_model
+
         return final_text
 
     def handle_tool_calls(self, tool_calls: list[ToolCall]) -> list[dict]:
@@ -347,6 +368,7 @@ class CodingAgent(BaseAgent):
             tool_name = tc.name
             tool_use_id = tc.tool_use_id
             args = tc.input
+            start_ms = int(time.monotonic() * 1000)
 
             if self._cancel.is_set():
                 return idx, {
@@ -358,6 +380,28 @@ class CodingAgent(BaseAgent):
 
             self.logger.tool_call(tool_name, args, tool_use_id)
             self._render_tool_call(tool_name, args)
+
+            # spawn_agent：特殊处理，创建隔离子代理
+            if tool_name == "spawn_agent":
+                from .sub_agent import SubAgent
+                task = args.get("task", "")
+                context = args.get("context", "")
+                self.console.print(f"[dim]→ 启动子代理：{task[:60]}...[/dim]"
+                                   if len(task) > 60 else
+                                   f"[dim]→ 启动子代理：{task}[/dim]")
+                try:
+                    sub = SubAgent(self.llm, self._tools_schema)
+                    result_text = sub.run(task=task, context=context)
+                except Exception as e:
+                    result_text = f"子代理执行失败: {e}"
+                elapsed = int(time.monotonic() * 1000) - start_ms
+                self.logger.tool_result(tool_name, tool_use_id, True, result_text[:80], elapsed, result_text)
+                return idx, {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": result_text,
+                    "is_error": False,
+                }
 
             # 权限检查
             description = args.get("description", "")
@@ -372,7 +416,6 @@ class CodingAgent(BaseAgent):
                 }
 
             self.logger.permission_check(tool_name, "execute", True)
-            start_ms = int(time.monotonic() * 1000)
 
             # 已读文件拦截：避免重复 read_file，节省 token
             if tool_name == "read_file":
@@ -410,6 +453,21 @@ class CodingAgent(BaseAgent):
                 if tool_name == "read_memory" and not result.is_error:
                     self.state.memory_tool_calls += 1
                     self.state.memory_tool_tokens += len(result.content or "") // 4
+
+                # write_file / edit_file 成功后自动附加语法验证
+                if tool_name in ("write_file", "edit_file") and not result.is_error:
+                    written_path = args.get("file_path", "")
+                    if written_path:
+                        try:
+                            from ..tools.compile_tool import validate_file_str
+                            validation = validate_file_str(written_path)
+                            result = ToolResult(
+                                content=f"{result.content or ''}\n\n{validation}",
+                                is_error=result.is_error,
+                                metadata=result.metadata,
+                            )
+                        except Exception:
+                            pass  # 验证失败不阻断写入
 
                 elapsed = int(time.monotonic() * 1000) - start_ms
                 full_content = result.content or ""
