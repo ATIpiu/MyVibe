@@ -37,6 +37,21 @@ from rich.panel import Panel
 # 折叠时保留的尾部行数
 TAIL_LINES = 3
 
+# ── 全局"当前输出"注册（供 Ctrl+O 按键绑定访问）──────────────
+
+_current_output: Optional["CollapsibleOutput"] = None
+
+
+def set_current(co: "CollapsibleOutput") -> None:
+    """注册最近一次工具输出，供全局 Ctrl+O 绑定切换。"""
+    global _current_output
+    _current_output = co
+
+
+def get_current() -> Optional["CollapsibleOutput"]:
+    """返回最近一次工具输出（可能为 None）。"""
+    return _current_output
+
 
 class CollapsibleOutput:
     """实时可折叠输出面板。"""

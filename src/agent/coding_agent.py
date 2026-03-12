@@ -443,6 +443,10 @@ class CodingAgent(BaseAgent):
                     from ..tools.base_tool import ToolResult as _TR
                     result = _TR(content=f"shell 执行异常: {e}", is_error=True)
 
+                # 注册为"当前输出"，供输入提示阶段的 Ctrl+O 访问
+                from ..ui.collapsible_output import set_current
+                set_current(co)
+
                 # 用成功/失败颜色更新显示已通过 Live 完成，仅记录日志
                 elapsed = int(time.monotonic() * 1000) - start_ms
                 full_content = result.content or ""

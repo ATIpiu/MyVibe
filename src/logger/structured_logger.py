@@ -112,6 +112,10 @@ class StructuredLogger:
         co.feed(display_content or "(空结果)")
         co.print_static()
 
+        # 注册为"当前输出"，供 Ctrl+O 全局快捷键访问
+        from ..ui.collapsible_output import set_current
+        set_current(co)
+
     def tool_error(self, tool_name: str, tool_use_id: str, error: Exception) -> None:
         tb = traceback.format_exc()
         self.log(LogEvent.TOOL_ERROR, {"tool_name": tool_name, "tool_use_id": tool_use_id, "error": str(error), "traceback": tb}, level="ERROR")

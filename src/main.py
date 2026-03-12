@@ -30,8 +30,9 @@ import src.tools.file          # noqa: F401
 import src.tools.shell         # noqa: F401
 import src.tools.git           # noqa: F401
 import src.tools.lsp           # noqa: F401
-import src.tools.context_tools # noqa: F401
-import src.tools.memory_tools  # noqa: F401
+import src.tools.context_tools  # noqa: F401
+import src.tools.memory_tools   # noqa: F401
+import src.tools.compile_tool   # noqa: F401
 
 from src.memory.memory_manager import get_memory_manager
 from src.tools.memory_tools import set_memory_manager
@@ -307,6 +308,59 @@ def handle_slash_command(
         agent.state.plan_mode = not agent.state.plan_mode
         return True
 
+    elif cmd == "/tasks":
+        from src.tasks.task_manager import get_task_manager
+        manager = get_task_manager()
+        console.print(manager.format_list())
+        return True
+
+    elif cmd == "/task":
+        from src.tasks.task_manager import get_task_manager
+        manager = get_task_manager()
+        if not arg:
+            console.print("[yellow]用法：/task <task_id>[/yellow]")
+        else:
+            console.print(manager.format_detail(arg.strip()))
+        return True
+
+    elif cmd == "/bg":
+        # 后台执行一个独立子代理任务
+        if not arg:
+            console.print("[yellow]用法：/bg <任务描述>[/yellow]")
+            return True
+        from src.tasks.task_manager import get_task_manager
+        from src.agent.sub_agent import SubAgent
+        manager = get_task_manager()
+
+        def _bg_run():
+            sub = SubAgent(agent.llm, agent._tools_schema)
+            return sub.run(task=arg)
+
+        task = manager.submit(name=f"bg: {arg[:40]}", func=_bg_run, description=arg)
+        console.print(f"[green]后台任务已提交，ID: {task.id}[/green]  使用 /task {task.id} 查看结果")
+        return True
+
+    elif cmd == "/skills":
+        # 列出所有已加载的 Skills
+        from src.skills.skill_registry import get_registry
+        registry = get_registry()
+        skills = registry.all_skills()
+        if not skills:
+            console.print("[dim]暂无已加载的 Skills。将 .md 文件放到 ~/.myvibe/skills/ 目录即可。[/dim]")
+        else:
+            table = Table(title=f"已加载 Skills（{len(skills)} 个）", show_header=True)
+            table.add_column("名称", style="cyan")
+            table.add_column("描述")
+            table.add_column("触发词", style="dim")
+            for s in skills:
+                table.add_row(
+                    f"/{s.name}",
+                    s.description,
+                    ", ".join(s.triggers[:3]),
+                )
+            console.print(table)
+        return True
+
     elif cmd == "/help":
         help_text = (
             "[bold]可用斜杠命令：[/bold]\n"
@@ -319,11 +373,32 @@ def handle_slash_command(
             "  /history       - 查看对话轮次 git 提交历史\n"
             "  /revert        - 列出历史轮次并交互选择回退目标\n"
             "  /plan          - 切换计划模式（Ctrl+P）\n"
+            "  Ctrl+O         - 展开/折叠最近一次工具输出（执行中实时切换，结束后重新打印）\n"
+            "  /skills        - 列出所有已加载的 Skills\n"
+            "  /<skill-name>  - 调用指定 Skill（如 /commit、/review）\n"
             "  /help          - 显示此帮助\n"
             "  /exit          - 退出程序"
         )
         console.print(Panel(help_text, title="帮助", border_style="blue"))
         return True
+
+    # Skill 命令：动态匹配已注册的 Skill
+    cmd_name = cmd.lstrip("/")
+    if cmd_name:
+        try:
+            from src.skills.skill_registry import get_registry
+            registry = get_registry()
+            skill = registry.get(cmd_name)
+            if skill:
+                expanded = skill.render(arg)
+                console.print(f"[dim]→ 展开 Skill [{skill.name}]: {expanded[:60]}...[/dim]"
+                               if len(expanded) > 60 else
+                               f"[dim]→ 展开 Skill [{skill.name}]: {expanded}[/dim]")
+                if _pending_box is not None:
+                    _pending_box.append(expanded)
+                return True
+        except Exception:
+            pass
 
     return False
 
@@ -468,7 +543,7 @@ def display_welcome(
         lines.append(f"[dim]工具数:[/dim]   {tools_count} 个可用工具（文件/Shell/Git/LSP/记忆等）")
     if project_root:
         lines.append(f"[dim]项目目录:[/dim] {project_root}")
-    lines.append("[dim]输入 /help 查看命令  ·  Ctrl+P 切换计划模式  ·  Ctrl+C 中断[/dim]")
+    lines.append("[dim]输入 /help 查看命令  ·  Ctrl+P 计划模式  ·  Ctrl+O 展开/折叠输出  ·  Ctrl+C 中断[/dim]")
     console.print(Panel("\n".join(lines), border_style="cyan", expand=False))
 
 
@@ -871,6 +946,22 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
                 plan_agent.reset()
             event.app.invalidate()
 
+        @kb.add("c-o")
+        def toggle_last_output(event):
+            """Ctrl+O：切换最近一次工具输出的展开/折叠状态，并重新打印。"""
+            from src.ui.collapsible_output import get_current
+
+            co = get_current()
+            if co is None:
+                return
+
+            co.toggle()
+
+            def _reprint():
+                co.print_static()
+
+            event.app.run_in_terminal(_reprint)
+
         prompt_session = PromptSession(
             history=FileHistory(str(history_file)),
             completer=completer,
@@ -1188,6 +1279,12 @@ def main() -> None:
 
     # 初始化 LSP 客户端（懒启动，首次调用工具时才真正连接）
     set_lsp_root(project_root)
+
+    # 加载 Skills（内置 + 用户自定义 ~/.myvibe/skills/）
+    from src.skills.skill_registry import get_registry as _get_skill_registry
+    _skill_count = _get_skill_registry().load_all()
+    if _skill_count:
+        console.print(f"[dim]已加载 {_skill_count} 个 Skills[/dim]")
 
     agent = CodingAgent(
         llm_client=llm_client,
