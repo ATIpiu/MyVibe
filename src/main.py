@@ -957,10 +957,25 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
 
             co.toggle()
 
-            def _reprint():
-                co.print_static()
+            # 将 Rich Panel 渲染到字符串缓冲，通过 prompt_toolkit 的
+            # print_formatted_text + ANSI 打印到当前提示行上方
+            try:
+                import io
+                from rich.console import Console as _RichConsole
+                from prompt_toolkit.formatted_text import ANSI
+                from prompt_toolkit import print_formatted_text as _pt_print
 
-            event.app.run_in_terminal(_reprint)
+                buf = io.StringIO()
+                tmp = _RichConsole(
+                    file=buf,
+                    highlight=False,
+                    markup=True,
+                    width=console.width,
+                )
+                tmp.print(co._build_panel())
+                _pt_print(ANSI(buf.getvalue()))
+            except Exception:
+                pass
 
         prompt_session = PromptSession(
             history=FileHistory(str(history_file)),
