@@ -34,7 +34,11 @@ class ReadMemoryTool(BaseTool):
         "- scope='all'：返回全项目所有模块及其函数列表（项目全览）\n"
         "- scope='modules'：返回指定模块的函数列表（需提供 modules 参数）\n"
         "- scope='function'：返回指定函数的完整源码 + 调用关系（需提供 function_key 参数）\n"
-        "function_key 格式：'module_path:qualname'，类方法写法：'src/foo.py:MyClass.method'"
+        "function_key 格式：'module_path:qualname'，类方法写法：'src/foo.py:MyClass.method'\n\n"
+        "## 使用优先级：最高\n"
+        "在读取任何文件之前，先调用此工具了解项目结构。\n"
+        "scope='all' 获取模块列表 → scope='modules' 获取函数列表 → scope='function' 获取函数源码。\n"
+        "多数情况下 scope='function' 已能替代 read_file，节省大量 token。"
     )
     input_schema = {
         "type": "object",

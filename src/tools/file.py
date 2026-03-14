@@ -1,9 +1,12 @@
-"""文件操作工具：读取、写入、编辑、搜索。"""
+"""文件操作工具：读取、写入、编辑、搜索、glob、grep。"""
 from __future__ import annotations
 
+import glob as _glob
 import re
+import subprocess
 import threading
 from pathlib import Path
+from typing import Optional
 
 from .base_tool import BaseTool, ToolRegistry, ToolResult
 from ..utils.path import safe_resolve
@@ -92,9 +95,15 @@ class ReadFileTool(BaseTool):
 
     name = "read_file"
     description = (
-        "读取文件内容，每行带行号前缀。支持分页（offset/limit）。"
-        "返回格式：'行号→内容'，便于精确引用。"
-        """注意：本会话中已完整读取过的文件再次调用本工具时，将自动返回"已在上下文"提示。"""
+        "读取文件内容，每行带行号前缀。支持分页（offset/limit）。\n"
+        "返回格式：'行号→内容'，便于精确引用。\n\n"
+        "## 使用优先级：最低（最后手段）\n"
+        "在调用此工具前，应已经：\n"
+        "1. 用 read_memory(scope='all') 了解项目结构\n"
+        "2. 用 grep_files/glob_files 定位到目标文件和行号\n\n"
+        "已在本会话读取过的文件会被自动拦截（节省 token），"
+        "系统会提示改用 read_memory(scope='function') 获取函数级内容。\n\n"
+        "当目标明确时，用 offset+limit 只读需要的行，不要读整个文件。"
     )
     input_schema = {
         "type": "object",
@@ -265,7 +274,11 @@ class SearchFileTool(BaseTool):
     """单文件正则搜索，返回匹配行及上下文。"""
 
     name = "search_in_file"
-    description = "在单个文件中用正则表达式搜索，返回匹配行及前后上下文行。"
+    description = (
+        "在单个文件中用正则表达式搜索，返回匹配行及前后上下文行。\n\n"
+        "仅搜索单个文件。跨文件搜索请用 grep_files。\n"
+        "通常先用 grep_files 找到文件，再用此工具在文件内精确搜索。"
+    )
     input_schema = {
         "type": "object",
         "properties": {
@@ -282,28 +295,61 @@ class SearchFileTool(BaseTool):
                 "description": "每个匹配前后显示的上下文行数，默认2",
                 "default": 2,
             },
+            "-A": {
+                "type": "integer",
+                "description": "每个匹配后显示的行数（覆盖 context 的after部分）",
+            },
+            "-B": {
+                "type": "integer",
+                "description": "每个匹配前显示的行数（覆盖 context 的before部分）",
+            },
+            "-i": {
+                "type": "boolean",
+                "description": "大小写不敏感，默认 false",
+                "default": False,
+            },
+            "output_mode": {
+                "type": "string",
+                "enum": ["content", "count"],
+                "description": "content（默认）返回匹配行，count 只返回匹配数量",
+                "default": "content",
+            },
         },
         "required": ["file_path", "pattern"],
     }
 
-    def execute(self, file_path: str, pattern: str, context: int = 2) -> ToolResult:
+    def execute(
+        self,
+        file_path: str,
+        pattern: str,
+        context: int = 2,
+        **kwargs,
+    ) -> ToolResult:
+        after = kwargs.get("-A", context)
+        before = kwargs.get("-B", context)
+        case_insensitive = kwargs.get("-i", False)
+        output_mode = kwargs.get("output_mode", "content")
         try:
             resolved = safe_resolve(file_path)
             if not resolved.exists():
                 return ToolResult(content=f"文件不存在: {file_path}", is_error=True)
 
             lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
-            regex = re.compile(pattern)
+            flags = re.IGNORECASE if case_insensitive else 0
+            regex = re.compile(pattern, flags)
 
             match_indices = [i for i, line in enumerate(lines) if regex.search(line)]
             if not match_indices:
                 return ToolResult(content=f"未找到匹配: {pattern}")
 
+            if output_mode == "count":
+                return ToolResult(content=f"在 {file_path} 中找到 {len(match_indices)} 处匹配")
+
             shown: set[int] = set()
             parts = []
             for idx in match_indices:
-                start = max(0, idx - context)
-                end = min(len(lines), idx + context + 1)
+                start = max(0, idx - before)
+                end = min(len(lines), idx + after + 1)
                 if parts and start <= max(shown):
                     # 合并相邻片段
                     start = max(shown) + 1
@@ -323,3 +369,268 @@ class SearchFileTool(BaseTool):
             return ToolResult(content=str(e), is_error=True)
         except Exception as e:
             return ToolResult(content=f"搜索失败: {e}", is_error=True)
+
+
+@ToolRegistry.register
+class GlobFilesTool(BaseTool):
+    """快速文件名模式匹配，按修改时间倒序返回路径列表。"""
+
+    name = "glob_files"
+    description = (
+        "快速文件名模式匹配（glob），按修改时间倒序返回匹配路径列表。\n\n"
+        "## 工具使用优先级链\n"
+        "1. read_memory(scope='all') → 了解项目模块结构\n"
+        "2. glob_files（本工具）→ 按名称模式定位文件\n"
+        "3. grep_files → 按内容定位具体位置\n"
+        "4. read_file → 仅当需要完整上下文时才读取\n\n"
+        "## 适用场景\n"
+        "- 查找特定模式的文件：**/*.py、src/**/*.ts\n"
+        "- 确认文件是否存在\n"
+        "- 获取目录下的文件列表\n\n"
+        "## 不适用场景\n"
+        "- 搜索文件内容 → 用 grep_files\n"
+        "- 已知确切路径 → 直接 read_file\n"
+        "不要用 shell find/ls 替代此工具。"
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "glob 模式，如 **/*.py、src/**/*.ts、*.json",
+            },
+            "path": {
+                "type": "string",
+                "description": "搜索根目录，默认为 agent 工作目录",
+            },
+        },
+        "required": ["pattern"],
+    }
+
+    def execute(self, pattern: str, path: Optional[str] = None) -> ToolResult:
+        try:
+            base = Path(path) if path else safe_resolve(".")
+            if not base.exists():
+                return ToolResult(content=f"目录不存在: {path}", is_error=True)
+
+            # 使用 pathlib rglob 或 glob.glob 递归匹配
+            if "**" in pattern:
+                matches = list(base.glob(pattern))
+            else:
+                matches = list(base.glob(pattern)) or list(base.rglob(pattern))
+
+            # 过滤只保留文件，按 mtime 倒序
+            files = [p for p in matches if p.is_file()]
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+            if not files:
+                return ToolResult(content=f"未找到匹配 '{pattern}' 的文件")
+
+            lines = [f"找到 {len(files)} 个文件（按修改时间倒序）:"]
+            for p in files:
+                lines.append(str(p))
+            return ToolResult(content="\n".join(lines))
+        except Exception as e:
+            return ToolResult(content=f"glob 搜索失败: {e}", is_error=True)
+
+
+@ToolRegistry.register
+class GrepFilesTool(BaseTool):
+    """跨文件正则内容搜索，基于 ripgrep 或 Python re 回退。"""
+
+    name = "grep_files"
+    description = (
+        "跨文件正则内容搜索（基于 ripgrep 或 Python re 回退）。\n\n"
+        "## 工具使用优先级链\n"
+        "1. read_memory → 了解项目模块/函数结构\n"
+        "2. grep_files（本工具）→ 定位到具体位置（文件+行号）\n"
+        "3. read_file → 仅当需要完整上下文时才读取文件\n\n"
+        "用此工具确定目标函数位置后，用 read_file 的 offset+limit 只读那几行，"
+        "而不是读整个文件。\n\n"
+        "## 输出模式（output_mode）\n"
+        "- files_with_matches（默认）：只返回匹配的文件路径，适合快速定位\n"
+        "- content：返回匹配行及上下文，适合直接查看代码\n"
+        "- count：返回每文件匹配数量\n\n"
+        "不要用 shell grep/rg 替代此工具。"
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "正则表达式搜索模式",
+            },
+            "path": {
+                "type": "string",
+                "description": "搜索根目录，默认为 agent 工作目录",
+            },
+            "glob": {
+                "type": "string",
+                "description": "文件过滤 glob 模式，如 *.py、**/*.ts",
+            },
+            "output_mode": {
+                "type": "string",
+                "enum": ["files_with_matches", "content", "count"],
+                "description": "输出模式，默认 files_with_matches",
+                "default": "files_with_matches",
+            },
+            "context": {
+                "type": "integer",
+                "description": "output_mode=content 时每个匹配前后的上下文行数，默认 2",
+                "default": 2,
+            },
+            "-A": {
+                "type": "integer",
+                "description": "每个匹配后显示的行数",
+            },
+            "-B": {
+                "type": "integer",
+                "description": "每个匹配前显示的行数",
+            },
+            "-i": {
+                "type": "boolean",
+                "description": "大小写不敏感，默认 false",
+                "default": False,
+            },
+            "head_limit": {
+                "type": "integer",
+                "description": "限制输出条数，防止海量输出，默认不限制",
+            },
+        },
+        "required": ["pattern"],
+    }
+
+    def execute(self, pattern: str, path: Optional[str] = None, **kwargs) -> ToolResult:
+        glob_filter = kwargs.get("glob")
+        output_mode = kwargs.get("output_mode", "files_with_matches")
+        context = kwargs.get("context", 2)
+        after = kwargs.get("-A", context)
+        before = kwargs.get("-B", context)
+        case_insensitive = kwargs.get("-i", False)
+        head_limit = kwargs.get("head_limit")
+
+        base = str(Path(path) if path else safe_resolve("."))
+
+        # 优先尝试 ripgrep
+        result = self._try_rg(
+            pattern, base, glob_filter, output_mode, after, before,
+            case_insensitive, head_limit,
+        )
+        if result is not None:
+            return result
+
+        # 降级到 Python re
+        return self._python_grep(
+            pattern, base, glob_filter, output_mode, after, before,
+            case_insensitive, head_limit,
+        )
+
+    def _try_rg(
+        self, pattern, base, glob_filter, output_mode, after, before,
+        case_insensitive, head_limit,
+    ) -> Optional[ToolResult]:
+        try:
+            cmd = ["rg", "--no-heading"]
+            if case_insensitive:
+                cmd.append("-i")
+            if glob_filter:
+                cmd += ["--glob", glob_filter]
+
+            if output_mode == "files_with_matches":
+                cmd.append("-l")
+            elif output_mode == "count":
+                cmd.append("-c")
+            else:  # content
+                cmd += [f"-A{after}", f"-B{before}"]
+
+            cmd += [pattern, base]
+
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30, encoding="utf-8",
+                errors="replace",
+            )
+            if proc.returncode not in (0, 1):
+                return None  # rg 不存在或出错，降级
+
+            output = proc.stdout.strip()
+            if not output:
+                return ToolResult(content=f"未找到匹配: {pattern}")
+
+            lines = output.splitlines()
+            if head_limit:
+                lines = lines[:head_limit]
+            return ToolResult(content="\n".join(lines))
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+            return None
+
+    def _python_grep(
+        self, pattern, base, glob_filter, output_mode, after, before,
+        case_insensitive, head_limit,
+    ) -> ToolResult:
+        try:
+            flags = re.IGNORECASE if case_insensitive else 0
+            regex = re.compile(pattern, flags)
+
+            # 收集候选文件
+            base_path = Path(base)
+            if glob_filter:
+                candidates = list(base_path.rglob(glob_filter))
+            else:
+                candidates = list(base_path.rglob("*"))
+            candidates = [p for p in candidates if p.is_file()]
+
+            results_files: list[str] = []
+            results_content: list[str] = []
+            count_map: dict[str, int] = {}
+
+            for file_path in candidates:
+                try:
+                    text = file_path.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                file_lines = text.splitlines()
+                match_indices = [i for i, ln in enumerate(file_lines) if regex.search(ln)]
+                if not match_indices:
+                    continue
+
+                rel = str(file_path)
+                if output_mode == "files_with_matches":
+                    results_files.append(rel)
+                elif output_mode == "count":
+                    count_map[rel] = len(match_indices)
+                else:
+                    shown: set[int] = set()
+                    for idx in match_indices:
+                        start = max(0, idx - before)
+                        end = min(len(file_lines), idx + after + 1)
+                        if results_content:
+                            results_content.append("--")
+                        for i in range(start, end):
+                            if i not in shown:
+                                marker = ":" if i == idx else "-"
+                                results_content.append(f"{rel}:{i+1}{marker}{file_lines[i]}")
+                                shown.add(i)
+
+            if output_mode == "files_with_matches":
+                if not results_files:
+                    return ToolResult(content=f"未找到匹配: {pattern}")
+                if head_limit:
+                    results_files = results_files[:head_limit]
+                return ToolResult(content="\n".join(results_files))
+            elif output_mode == "count":
+                if not count_map:
+                    return ToolResult(content=f"未找到匹配: {pattern}")
+                lines = [f"{f}: {c}" for f, c in count_map.items()]
+                if head_limit:
+                    lines = lines[:head_limit]
+                return ToolResult(content="\n".join(lines))
+            else:
+                if not results_content:
+                    return ToolResult(content=f"未找到匹配: {pattern}")
+                if head_limit:
+                    results_content = results_content[:head_limit]
+                return ToolResult(content="\n".join(results_content))
+        except re.error as e:
+            return ToolResult(content=f"正则表达式错误: {e}", is_error=True)
+        except Exception as e:
+            return ToolResult(content=f"grep 搜索失败: {e}", is_error=True)

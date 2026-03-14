@@ -24,8 +24,10 @@ from ..memory.memory_manager import get_memory_manager
 
 # 自动允许（无需确认）的工具列表（可由配置覆盖）
 DEFAULT_AUTO_ALLOW = {
-    "read_file", "search_in_file", "git_status", "git_diff",
+    "read_file", "search_in_file", "glob_files", "grep_files",
+    "git_status", "git_diff",
     "read_memory", "lsp_hover",
+    "ask_user",   # 询问用户 = 本身就是用户交互，无需二次确认
 }
 
 MODEL_MAX_TOKENS = 200_000

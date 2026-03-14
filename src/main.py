@@ -33,6 +33,7 @@ import src.tools.lsp           # noqa: F401
 import src.tools.context_tools  # noqa: F401
 import src.tools.memory_tools   # noqa: F401
 import src.tools.compile_tool   # noqa: F401
+import src.tools.ask_user_tool  # noqa: F401
 
 from src.memory.memory_manager import get_memory_manager
 from src.tools.memory_tools import set_memory_manager
@@ -596,6 +597,78 @@ def display_memory_stats(console: Console, memory_manager) -> None:
         pass
 
 
+# ─────────────────── ask_user 工具 UI 实现 ────────────────────
+
+def _ask_user_interactive(
+    question: str,
+    options: list,
+    allow_custom: bool,
+    prompt_session,
+    console: Console,
+) -> "Optional[str]":
+    """ask_user 工具的 UI 实现：展示问题，收集用户回答。
+
+    - 有 options：显示数字选择菜单（最后一项为自定义输入，若 allow_custom=True）
+    - 无 options：纯文本输入框
+
+    Returns:
+        用户回答字符串，或 None 表示取消。
+    """
+    console.print(f"\n[bold cyan]❓ {question}[/bold cyan]")
+
+    if options:
+        # 补充"自定义"选项
+        if allow_custom and not any(kw in (options[-1] if options else "") for kw in ("自定义", "custom", "其他")):
+            options = list(options) + ["其他 / 自定义输入"]
+
+        n = len(options)
+        for j, opt in enumerate(options, 1):
+            if j == n and allow_custom:
+                console.print(f"  [dim]{j}. {opt}[/dim]")
+            else:
+                console.print(f"  [bold]{j}.[/bold] {opt}")
+
+        idx = _keypress_select(n, prompt_session)
+        if idx is None:
+            return None
+
+        if allow_custom and idx == n - 1:
+            # 自定义输入
+            try:
+                from prompt_toolkit.formatted_text import HTML
+                if prompt_session is not None:
+                    custom = prompt_session.prompt(
+                        HTML("<ansiyellow>  请输入自定义内容：</ansiyellow> ")
+                    ).strip()
+                else:
+                    custom = input("  请输入自定义内容：").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if custom:
+                console.print(f"[green]  ✓ 自定义：{custom}[/green]")
+                return custom
+            return None
+        else:
+            chosen = options[idx]
+            console.print(f"[green]  ✓ 已选择：{chosen}[/green]")
+            return chosen
+    else:
+        # 纯文本输入
+        try:
+            from prompt_toolkit.formatted_text import HTML
+            if prompt_session is not None:
+                answer = prompt_session.prompt(
+                    HTML("<ansiyellow>  请输入回答：</ansiyellow> ")
+                ).strip()
+            else:
+                answer = input("  请输入回答：").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if answer:
+            console.print(f"[green]  ✓ 已输入：{answer}[/green]")
+        return answer or None
+
+
 # ─────────────────── 计划模式问题解析与交互 ────────────────────
 
 def _has_plan_questions(text: str) -> bool:
@@ -984,6 +1057,12 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
             complete_while_typing=True,
             key_bindings=kb,
             bottom_toolbar=get_toolbar,
+        )
+
+        # 注入 ask_user 工具的 UI 实现（需要 prompt_session 和 console 的闭包）
+        from src.tools.ask_user_tool import set_ask_user_handler
+        set_ask_user_handler(
+            lambda q, opts, ac: _ask_user_interactive(q, opts, ac, prompt_session, console)
         )
 
         _pending_input: Optional[str] = None

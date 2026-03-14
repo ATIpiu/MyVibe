@@ -92,7 +92,12 @@ class ShellTool(BaseTool):
     name = "shell"
     description = (
         "在系统 shell 中执行命令。会进行注入检测和危险命令检查。"
-        "危险命令需要用户确认。输出超过 10000 字符时自动截断。"
+        "危险命令需要用户确认。输出超过 10000 字符时自动截断。\n\n"
+        "重要：不要用 shell 做以下操作（有专用工具更安全高效）：\n"
+        "- 文件搜索 → glob_files（不要 find/ls）\n"
+        "- 内容搜索 → grep_files（不要 grep/rg）\n"
+        "- 文件读取 → read_file（不要 cat/head/tail）\n"
+        "- 文件编辑 → edit_file（不要 sed/awk）"
     )
     input_schema = {
         "type": "object",
