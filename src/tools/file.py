@@ -270,108 +270,6 @@ class EditFileTool(BaseTool):
 
 
 @ToolRegistry.register
-class SearchFileTool(BaseTool):
-    """单文件正则搜索，返回匹配行及上下文。"""
-
-    name = "search_in_file"
-    description = (
-        "在单个文件中用正则表达式搜索，返回匹配行及前后上下文行。\n\n"
-        "仅搜索单个文件。跨文件搜索请用 grep_files。\n"
-        "通常先用 grep_files 找到文件，再用此工具在文件内精确搜索。"
-    )
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "file_path": {
-                "type": "string",
-                "description": "要搜索的文件路径",
-            },
-            "pattern": {
-                "type": "string",
-                "description": "Python 正则表达式搜索模式",
-            },
-            "context": {
-                "type": "integer",
-                "description": "每个匹配前后显示的上下文行数，默认2",
-                "default": 2,
-            },
-            "-A": {
-                "type": "integer",
-                "description": "每个匹配后显示的行数（覆盖 context 的after部分）",
-            },
-            "-B": {
-                "type": "integer",
-                "description": "每个匹配前显示的行数（覆盖 context 的before部分）",
-            },
-            "-i": {
-                "type": "boolean",
-                "description": "大小写不敏感，默认 false",
-                "default": False,
-            },
-            "output_mode": {
-                "type": "string",
-                "enum": ["content", "count"],
-                "description": "content（默认）返回匹配行，count 只返回匹配数量",
-                "default": "content",
-            },
-        },
-        "required": ["file_path", "pattern"],
-    }
-
-    def execute(
-        self,
-        file_path: str,
-        pattern: str,
-        context: int = 2,
-        **kwargs,
-    ) -> ToolResult:
-        after = kwargs.get("-A", context)
-        before = kwargs.get("-B", context)
-        case_insensitive = kwargs.get("-i", False)
-        output_mode = kwargs.get("output_mode", "content")
-        try:
-            resolved = safe_resolve(file_path)
-            if not resolved.exists():
-                return ToolResult(content=f"文件不存在: {file_path}", is_error=True)
-
-            lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
-            flags = re.IGNORECASE if case_insensitive else 0
-            regex = re.compile(pattern, flags)
-
-            match_indices = [i for i, line in enumerate(lines) if regex.search(line)]
-            if not match_indices:
-                return ToolResult(content=f"未找到匹配: {pattern}")
-
-            if output_mode == "count":
-                return ToolResult(content=f"在 {file_path} 中找到 {len(match_indices)} 处匹配")
-
-            shown: set[int] = set()
-            parts = []
-            for idx in match_indices:
-                start = max(0, idx - before)
-                end = min(len(lines), idx + after + 1)
-                if parts and start <= max(shown):
-                    # 合并相邻片段
-                    start = max(shown) + 1
-                if start > (max(shown) + 1 if shown else 0):
-                    parts.append("  ...")
-                for i in range(start, end):
-                    if i not in shown:
-                        marker = "→" if i == idx else " "
-                        parts.append(f"{i+1:6d}{marker} {lines[i]}")
-                        shown.add(i)
-
-            header = f"在 {file_path} 中找到 {len(match_indices)} 处匹配:\n"
-            return ToolResult(content=header + "\n".join(parts))
-        except re.error as e:
-            return ToolResult(content=f"正则表达式错误: {e}", is_error=True)
-        except PermissionError as e:
-            return ToolResult(content=str(e), is_error=True)
-        except Exception as e:
-            return ToolResult(content=f"搜索失败: {e}", is_error=True)
-
-
-@ToolRegistry.register
 class GlobFilesTool(BaseTool):
     """快速文件名模式匹配，按修改时间倒序返回路径列表。"""
 
@@ -440,7 +338,7 @@ class GrepFilesTool(BaseTool):
 
     name = "grep_files"
     description = (
-        "跨文件正则内容搜索（基于 ripgrep 或 Python re 回退）。\n\n"
+        "正则内容搜索（基于 ripgrep 或 Python re 回退）。支持跨文件和单文件（path 指向具体文件）。\n\n"
         "## 工具使用优先级链\n"
         "1. read_memory → 了解项目模块/函数结构\n"
         "2. grep_files（本工具）→ 定位到具体位置（文件+行号）\n"
@@ -451,6 +349,7 @@ class GrepFilesTool(BaseTool):
         "- files_with_matches（默认）：只返回匹配的文件路径，适合快速定位\n"
         "- content：返回匹配行及上下文，适合直接查看代码\n"
         "- count：返回每文件匹配数量\n\n"
+        "单文件搜索：path 直接传文件路径即可，无需其他工具。\n"
         "不要用 shell grep/rg 替代此工具。"
     )
     input_schema = {

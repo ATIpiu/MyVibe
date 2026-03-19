@@ -1,10 +1,12 @@
 """记忆工具：2个智能工具替代原来的14个细碎工具。
 
-read_memory   - 分层读取（all / modules / function）
+read_memory    - 分层读取（overview / file / function）
 rebuild_memory - 初始化或重建记忆索引
+find_symbol    - 查找符号所在函数，直接定位，跳过前两步
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 from .base_tool import BaseTool, ToolRegistry, ToolResult
@@ -26,32 +28,35 @@ def _get_manager():
 
 @ToolRegistry.register
 class ReadMemoryTool(BaseTool):
-    """智能分层读取项目记忆（函数列表 / 模块详情 / 函数源码+调用关系）。"""
+    """智能分层读取项目记忆（全局文件总览 / 文件函数列表 / 函数源码+调用关系）。"""
 
     name = "read_memory"
     description = (
         "读取项目代码记忆。scope 控制读取粒度：\n"
-        "- scope='all'：返回全项目所有模块及其函数列表（项目全览）\n"
-        "- scope='modules'：返回指定模块的函数列表（需提供 modules 参数）\n"
+        "- scope='overview'：以紧凑树形文本返回全项目文件总览（只有文件名+模块描述，最省 token）\n"
+        "- scope='file'：返回指定文件的函数列表（需提供 files 参数）\n"
         "- scope='function'：返回指定函数的完整源码 + 调用关系（需提供 function_key 参数）\n"
         "function_key 格式：'module_path:qualname'，类方法写法：'src/foo.py:MyClass.method'\n\n"
+        "## 标准三层调用链\n"
+        "read_memory(overview) → 确定目标文件\n"
+        "read_memory(file, files=[...]) → 确认函数列表\n"
+        "read_memory(function, function_key=...) → 获取源码\n\n"
         "## 使用优先级：最高\n"
         "在读取任何文件之前，先调用此工具了解项目结构。\n"
-        "scope='all' 获取模块列表 → scope='modules' 获取函数列表 → scope='function' 获取函数源码。\n"
-        "多数情况下 scope='function' 已能替代 read_file，节省大量 token。"
+        "已知变量名/调用名时，直接用 find_symbol 跳过前两步。"
     )
     input_schema = {
         "type": "object",
         "properties": {
             "scope": {
                 "type": "string",
-                "enum": ["all", "modules", "function"],
-                "description": "读取粒度：all=全项目 / modules=指定模块 / function=指定函数",
+                "enum": ["overview", "file", "function"],
+                "description": "读取粒度：overview=全项目文件总览 / file=指定文件函数列表 / function=指定函数源码",
             },
-            "modules": {
+            "files": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "scope='modules' 时必填，模块路径列表，如 ['src/utils/path.py']",
+                "description": "scope='file' 时必填，文件路径列表，如 ['src/utils/path.py']",
             },
             "function_key": {
                 "type": "string",
@@ -64,18 +69,23 @@ class ReadMemoryTool(BaseTool):
     def execute(
         self,
         scope: str,
-        modules: Optional[list] = None,
+        files: Optional[list] = None,
+        modules: Optional[list] = None,  # 向后兼容旧参数名
         function_key: Optional[str] = None,
     ) -> ToolResult:
         """智能读取项目记忆，按 scope 返回不同粒度的信息。"""
         mgr = _get_manager()
 
-        if scope == "all":
-            return self._read_all(mgr)
-        elif scope == "modules":
-            if not modules:
-                return ToolResult(content="scope='modules' 时必须提供 modules 参数", is_error=True)
-            return self._read_modules(mgr, modules)
+        # 旧 scope 别名兼容
+        scope = {"all": "overview", "modules": "file"}.get(scope, scope)
+        effective_files = files or modules
+
+        if scope == "overview":
+            return self._read_overview(mgr)
+        elif scope == "file":
+            if not effective_files:
+                return ToolResult(content="scope='file' 时必须提供 files 参数", is_error=True)
+            return self._read_files(mgr, effective_files)
         elif scope == "function":
             if not function_key:
                 return ToolResult(content="scope='function' 时必须提供 function_key 参数", is_error=True)
@@ -83,28 +93,18 @@ class ReadMemoryTool(BaseTool):
         else:
             return ToolResult(content=f"不支持的 scope: {scope}", is_error=True)
 
-    def _read_all(self, mgr) -> ToolResult:
-        all_memory = mgr.read_all()
-        if not all_memory:
+    def _read_overview(self, mgr) -> ToolResult:
+        """以紧凑树形文本返回全项目文件总览（无函数列表）。"""
+        overview_text = mgr.render_overview()
+        if not overview_text:
             return ToolResult(content="记忆为空，请先执行 rebuild_memory 建立索引")
+        total = len(mgr.read_all())
+        return ToolResult(content=f"项目文件总览（{total} 个模块）\n\n{overview_text}")
 
-        lines = [f"项目记忆总览：{len(all_memory)} 个模块\n"]
-        for module_path, module_data in sorted(all_memory.items()):
-            func_count = len(module_data.functions)
-            lines.append(f"## {module_path}（{func_count} 个函数）")
-            if module_data.purpose:
-                lines.append(f"  {module_data.purpose}")
-            for qualname, func_data in module_data.functions.items():
-                purpose = func_data.purpose or "（无描述）"
-                lines.append(f"  - {qualname}: {purpose}")
-            lines.append("")
-
-        return ToolResult(content="\n".join(lines))
-
-    def _read_modules(self, mgr, module_paths: list) -> ToolResult:
+    def _read_files(self, mgr, file_paths: list) -> ToolResult:
         lines = []
         missing = []
-        for module_path in module_paths:
+        for module_path in file_paths:
             module_data = mgr.read_module(module_path)
             if module_data is None:
                 missing.append(module_path)
@@ -207,3 +207,106 @@ class RebuildMemoryTool(BaseTool):
             return ToolResult(
                 content=f"全项目同步完成：{files} 个文件 / {modules} 个模块 / {funcs} 个函数"
             )
+
+
+@ToolRegistry.register
+class FindSymbolTool(BaseTool):
+    name = "find_symbol"
+    description = (
+        "查找符号（变量名、函数调用、类名）出现在哪些函数中，返回 module_path:qualname 列表。\n"
+        "返回结果可直接传给 read_memory(scope='function')，无需读整个文件。\n\n"
+        "典型场景：不知道某变量/调用在哪个函数里 → find_symbol → read_memory(function)"
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string", "description": "要查找的符号名，支持正则"},
+            "path":   {"type": "string", "description": "搜索范围目录，默认项目根目录"},
+            "glob":   {"type": "string", "description": "文件过滤，默认 '*.py'"},
+        },
+        "required": ["symbol"],
+    }
+
+    def execute(self, symbol: str, path: Optional[str] = None, glob: str = "*.py") -> ToolResult:
+        mgr = _get_manager()
+        file_line_map = self._grep_symbol(symbol, path or str(mgr.project_root), glob)
+        if not file_line_map:
+            return ToolResult(content=f"未找到符号 '{symbol}'")
+
+        found, seen = [], set()
+        for abs_path, line_numbers in file_line_map.items():
+            try:
+                rel_path = str(Path(abs_path).relative_to(mgr.project_root)).replace("\\", "/")
+            except ValueError:
+                rel_path = abs_path
+            ranges = mgr.get_function_ranges(rel_path)
+            for ln in line_numbers:
+                func_key = _find_enclosing_function(ranges, ln) if ranges else None
+                key = f"{rel_path}:{func_key}" if func_key else f"{rel_path}:(module-level)"
+                if key not in seen:
+                    seen.add(key)
+                    found.append(key)
+
+        lines = [f'找到 "{symbol}" 出现在 {len(found)} 个位置：']
+        lines += [f"  {k}" for k in found]
+        lines.append("\n提示：用 read_memory(scope='function', function_key='...') 查看源码")
+        return ToolResult(content="\n".join(lines))
+
+    def _grep_symbol(self, symbol: str, base: str, glob_filter: str) -> dict[str, list[int]]:
+        """返回 {abs_file_path: [line_no, ...]}，优先 rg，降级 Python re。"""
+        import re
+        import subprocess
+
+        file_line_map: dict[str, list[int]] = {}
+        # rg 路径
+        try:
+            proc = subprocess.run(
+                ["rg", "--no-heading", "-n", "--glob", glob_filter, symbol, base],
+                capture_output=True, text=True, timeout=30,
+                encoding="utf-8", errors="replace",
+            )
+            if proc.returncode in (0, 1):
+                for line in proc.stdout.splitlines():
+                    parts = line.split(":", 2)
+                    if len(parts) >= 2:
+                        try:
+                            file_line_map.setdefault(parts[0], []).append(int(parts[1]))
+                        except ValueError:
+                            pass
+                return file_line_map
+        except Exception:
+            pass
+        # Python re 降级
+        try:
+            regex = re.compile(symbol)
+            for fp in Path(base).rglob(glob_filter):
+                if not fp.is_file():
+                    continue
+                try:
+                    hits = [
+                        i + 1
+                        for i, ln in enumerate(
+                            fp.read_text(encoding="utf-8", errors="replace").splitlines()
+                        )
+                        if regex.search(ln)
+                    ]
+                    if hits:
+                        file_line_map[str(fp)] = hits
+                except Exception:
+                    pass
+        except re.error:
+            pass
+        return file_line_map
+
+
+# ── 模块级辅助 ────────────────────────────────────────────────────────────────
+
+def _find_enclosing_function(
+    ranges: dict[str, tuple[int, int]], line_no: int
+) -> Optional[str]:
+    """返回行号所在的最内层（最精确）函数 qualname，不在任何函数内则返回 None。"""
+    best, best_size = None, float("inf")
+    for qualname, (start, end) in ranges.items():
+        if start <= line_no <= end and (end - start) < best_size:
+            best, best_size = qualname, end - start
+    return best

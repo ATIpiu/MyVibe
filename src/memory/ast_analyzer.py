@@ -46,6 +46,17 @@ class AstAnalyzer:
 
         return ModuleData(purpose=purpose, functions=functions), calls_map
 
+    def get_function_ranges(self, file_path: Path) -> dict[str, tuple[int, int]]:
+        """返回 {qualname: (start_line, end_line)}，行号 1-indexed，每次实时 parse。"""
+        try:
+            source = file_path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(source)
+        except (OSError, SyntaxError):
+            return {}
+        ranges: dict[str, tuple[int, int]] = {}
+        _collect_ranges(tree, ranges, class_name="")
+        return ranges
+
     def get_function_source(self, file_path: Path, qualname: str) -> Optional[str]:
         """精确提取指定函数/方法的完整源码。"""
         source = file_path.read_text(encoding="utf-8", errors="replace")
@@ -157,6 +168,15 @@ def _find_function_node(
             if node.name == func_name:
                 return node
     return None
+
+
+def _collect_ranges(tree: ast.AST, ranges: dict, class_name: str) -> None:
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.ClassDef):
+            _collect_ranges(node, ranges, class_name=node.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            qualname = f"{class_name}.{node.name}" if class_name else node.name
+            ranges[qualname] = (node.lineno, getattr(node, "end_lineno", node.lineno))
 
 
 def _estimate_end(lines: list[str], start: int) -> int:

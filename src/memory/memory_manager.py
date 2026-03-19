@@ -1,4 +1,7 @@
-"""核心记忆管理器：CRUD + 自动同步 + 调用图维护。"""
+"""核心记忆管理器：CRUD + 自动同步 + 调用图维护。
+
+存储格式：memory_tree.json（嵌套路径树，节省 token）。
+"""
 from __future__ import annotations
 
 import threading
@@ -7,7 +10,7 @@ from typing import Optional
 
 from .ast_analyzer import AstAnalyzer
 from .models import FunctionData, ModuleData
-from .storage import MemoryStorage
+from .tree_storage import TreeStorage
 
 # 支持自动同步的文件扩展名
 _SYNCABLE_EXTENSIONS = {".py"}
@@ -26,16 +29,15 @@ def get_memory_manager(project_root: str) -> "MemoryManager":
 
 
 class MemoryManager:
-    """记忆管理器：协调 Storage + AstAnalyzer，对外暴露查询/更新接口。
+    """记忆管理器：协调 TreeStorage + AstAnalyzer，对外暴露查询/更新接口。
 
-    存储路径：{project_root}/.vibecoding/memory/
-    JSON 结构：memory.json = {module_path: ModuleData}
+    存储路径：{project_root}/.vibecoding/memory/memory_tree.json
     """
 
     def __init__(self, project_root: str) -> None:
         self.project_root = Path(project_root)
         self._memory_dir = self.project_root / ".vibecoding" / "memory"
-        self._storage = MemoryStorage(self._memory_dir)
+        self._storage = TreeStorage(self._memory_dir)
         self._analyzer = AstAnalyzer()
 
     # ──────────────────────────────── 读取接口 ────────────────────────────────
@@ -75,6 +77,30 @@ class MemoryManager:
         """按关键词搜索函数，返回 [(module_path, qualname, FunctionData), ...]。"""
         return self._storage.search(query=query, top_k=top_k)
 
+    def render_overview(self) -> str:
+        """文件级总览树（无函数列表），最省 token。"""
+        return self._storage.render_overview_text()
+
+    def get_function_ranges(self, module_path: str) -> dict[str, tuple[int, int]]:
+        """获取指定文件所有函数的行号范围，实时 parse，无持久化依赖。"""
+        file_path = self.project_root / module_path
+        if not file_path.exists():
+            return {}
+        return self._analyzer.get_function_ranges(file_path)
+
+    def render_tree(self) -> str:
+        """返回全项目记忆的紧凑树形文本（供 LLM 读取，大幅节省 token）。
+
+        示例：
+            src/
+              main.py  CLI 入口
+                parse_args  解析 CLI 参数
+              agent/
+                coding_agent.py  核心 agentic 循环
+                  PermissionManager.check  主权限检查
+        """
+        return self._storage.render_tree_text()
+
     # ──────────────────────────────── 同步接口 ────────────────────────────────
 
     def sync(self, file_path: str | Path | None = None) -> dict:
@@ -98,7 +124,6 @@ class MemoryManager:
 
         module_data, calls_map = self._analyzer.analyze_file(path, self.project_root)
         self._storage.upsert_module(rel_str, module_data)
-        # calls_map key 是 qualname，需要转为完整 key（module:qualname）
         full_calls_map = {qualname: callees for qualname, callees in calls_map.items()}
         self._storage.set_edges_for_module(rel_str, full_calls_map)
 
