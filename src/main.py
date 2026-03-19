@@ -77,6 +77,12 @@ def parse_args() -> Namespace:
         "--cwd",
         help="指定工作目录（默认为当前目录）",
     )
+    parser.add_argument(
+        "--super",
+        dest="super_mode",
+        action="store_true",
+        help="Super 模式：所有工具操作无需确认",
+    )
     return parser.parse_args()
 
 
@@ -309,6 +315,19 @@ def handle_slash_command(
         agent.state.plan_mode = not agent.state.plan_mode
         return True
 
+    elif cmd == "/super":
+        enabled = agent.permission.toggle_super()
+        if enabled:
+            console.print(Panel(
+                "[bold red]⚡ Super 模式已开启[/bold red]\n"
+                "[dim]所有工具操作将无需确认，包括文件写入、Shell 命令、Git 提交等。[/dim]",
+                border_style="red",
+                expand=False,
+            ))
+        else:
+            console.print("[green]Super 模式已关闭，恢复正常权限确认。[/green]")
+        return True
+
     elif cmd == "/tasks":
         from src.tasks.task_manager import get_task_manager
         manager = get_task_manager()
@@ -374,6 +393,7 @@ def handle_slash_command(
             "  /history       - 查看对话轮次 git 提交历史\n"
             "  /revert        - 列出历史轮次并交互选择回退目标\n"
             "  /plan          - 切换计划模式（Ctrl+P）\n"
+            "  /super         - 切换 Super 模式（所有操作无需确认）\n"
             "  Ctrl+O         - 展开/折叠最近一次工具输出（执行中实时切换，结束后重新打印）\n"
             "  /skills        - 列出所有已加载的 Skills\n"
             "  /<skill-name>  - 调用指定 Skill（如 /commit、/review）\n"
@@ -1365,6 +1385,7 @@ def main() -> None:
         require_confirm=set(perm_config.get("require_confirm", [])) or None,
         deny=set(perm_config.get("deny", [])) or None,
         console=console,
+        super_mode=args.super_mode,
     )
 
     # 初始化记忆管理器
@@ -1397,11 +1418,21 @@ def main() -> None:
     # 执行模式分支
     if args.print:
         display_welcome(console, session_id, model_name, project_root, tools_count=tools_count)
+        if args.super_mode:
+            console.print(Panel(
+                "[bold red]⚡ Super 模式已开启[/bold red]  [dim]所有操作无需确认[/dim]",
+                border_style="red", expand=False,
+            ))
         sync_and_display_memory(console, memory_manager)
         exit_code = run_headless(agent, args.print)
         sys.exit(exit_code)
     else:
         display_welcome(console, session_id, model_name, project_root, tools_count=tools_count)
+        if args.super_mode:
+            console.print(Panel(
+                "[bold red]⚡ Super 模式已开启[/bold red]  [dim]所有操作无需确认，使用 /super 可随时关闭[/dim]",
+                border_style="red", expand=False,
+            ))
         sync_and_display_memory(console, memory_manager)
         run_interactive_loop(agent, session_manager, cwd)
 

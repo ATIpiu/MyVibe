@@ -1,0 +1,25 @@
+╭──────────── Tool: shell ─────────────╮
+│   command: start /B python run.py    │
+│   description: 在后台启动Flask服务器 │
+╰──────────────────────────────────────╯
+╭────────── 权限确认: shell ───────────╮
+│   command: start /B python run.py    │
+│   description: 在后台启动Flask服务器 │
+╰──────────────────────────────────────╯
+允许执行？ (y=是 / n=否 / a=本会话始终允许) [y/n/a] (y):
+  [权限] shell (execute) → 已允许
+╭───────── ⚡ shell  [Ctrl+O 展开] ─────────╮
+│ … 15 行已折叠                             │
+│   * Restarting with watchdog (windowsapi) │
+│   * Debugger is active!                   │
+│   * Debugger PIN: 628-097-330             │
+╰───────────────────────────────────────────╯
+这种情况后台任务会卡住
+
+
+吧现在memory系统改为使用树结构，而不是json结构
+
+
+
+
+ctrl +o 不是实时监控，当输出的时候不能按。

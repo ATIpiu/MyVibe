@@ -42,11 +42,13 @@ class PermissionManager:
         require_confirm: Optional[set[str]] = None,
         deny: Optional[set[str]] = None,
         console: Optional[Console] = None,
+        super_mode: bool = False,
     ) -> None:
         self.auto_allow = auto_allow or DEFAULT_AUTO_ALLOW
         self.require_confirm = require_confirm or {"write_file", "edit_file", "shell", "git_commit"}
         self.deny = deny or set()
         self.console = console or Console()
+        self.super_mode = super_mode
         # 本会话中用户选择 "always" 允许的工具
         self._always_allow: set[str] = set()
         # 由 CodingAgent 注入，用于 Ctrl+C 时跳过 stdin 阻塞
@@ -54,8 +56,15 @@ class PermissionManager:
         # 串行化权限弹窗：并行工具调用时只允许一个提示同时占用 stdin
         self._prompt_lock = threading.Lock()
 
+    def toggle_super(self) -> bool:
+        """切换 super 模式，返回切换后的状态。"""
+        self.super_mode = not self.super_mode
+        return self.super_mode
+
     def check(self, tool_name: str, args: dict) -> bool:
         """主权限检查，返回 True 表示允许执行。"""
+        if self.super_mode:
+            return True
         if tool_name in self.deny:
             return False
         if tool_name in self.auto_allow or tool_name in self._always_allow:

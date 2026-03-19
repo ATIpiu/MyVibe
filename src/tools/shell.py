@@ -221,6 +221,7 @@ class ShellTool(BaseTool):
             proc = subprocess.Popen(
                 command,
                 shell=True,
+                stdin=subprocess.DEVNULL,   # 禁止子进程读取控制台，避免抢占 Ctrl+O 按键
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=cwd,

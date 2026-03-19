@@ -29,8 +29,8 @@ class CommandInfo:
 
 
 class CommandCompleter(Completer):
-    """命令补全器，提供斜杠命令补全及说明。"""
-    
+    """命令补全器，提供斜杠命令补全及说明（含动态 Skill 补全）。"""
+
     def __init__(self):
         """初始化命令补全器。"""
         self.commands: List[CommandInfo] = [
@@ -89,6 +89,31 @@ class CommandCompleter(Completer):
                 description="退出程序（同 /exit）",
                 usage="/quit 或 /exit"
             ),
+            CommandInfo(
+                name="/skills",
+                description="列出所有已加载的 Skills",
+                usage="/skills"
+            ),
+            CommandInfo(
+                name="/tasks",
+                description="查看所有后台任务列表",
+                usage="/tasks"
+            ),
+            CommandInfo(
+                name="/task",
+                description="查看指定后台任务详情",
+                usage="/task <task_id>"
+            ),
+            CommandInfo(
+                name="/bg",
+                description="在后台提交子代理任务",
+                usage="/bg <任务描述>"
+            ),
+            CommandInfo(
+                name="/super",
+                description="切换 Super 模式（所有操作无需确认）",
+                usage="/super"
+            ),
         ]
     
     def get_completions(
@@ -126,11 +151,12 @@ class CommandCompleter(Completer):
         if after_slash.startswith(" "):
             return
 
-        # 遍历命令列表进行匹配
+        prefix_lower = prefix.lower()
+
+        # 遍历内置命令列表进行匹配
         for cmd_info in self.commands:
             cmd_name = cmd_info.name[1:]  # 去掉斜杠，只补全斜杠后的部分
             cmd_lower = cmd_name.lower()
-            prefix_lower = prefix.lower()
 
             # 精确前缀匹配
             if cmd_lower.startswith(prefix_lower):
@@ -148,3 +174,21 @@ class CommandCompleter(Completer):
                     display_meta=cmd_info.description,
                     start_position=start_position,
                 )
+
+        # 动态补全：来自 Skill 注册表
+        try:
+            from src.skills.skill_registry import get_registry
+            registry = get_registry()
+            for skill_name, skill_desc in registry.completions():
+                skill_lower = skill_name.lower()
+                if skill_lower.startswith(prefix_lower) or (
+                    len(prefix) >= 2 and prefix_lower in skill_lower
+                ):
+                    yield Completion(
+                        text=skill_name,
+                        display=f"/{skill_name}",
+                        display_meta=f"[skill] {skill_desc}",
+                        start_position=start_position,
+                    )
+        except Exception:
+            pass  # Skill 模块未加载时静默跳过
