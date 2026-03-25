@@ -1,22 +1,20 @@
-"""智谱 AI (GLM) 客户端实现。
+"""OpenAI 兼容接口客户端实现。
 
-依赖 base_client.LLMClient，兼容智谱 OpenAI SSE 协议。
-包含：
-  - ZhipuLLMClient：流式 + 非流式调用实现
-  - _to_openai_messages / _to_openai_tools / _parse_tool_buffers：格式转换工具
+适用于所有兼容 OpenAI Chat Completions API 的服务（OpenAI、智谱、DeepSeek 等）。
+依赖 base_client.LLMClient，支持流式 + 非流式调用。
 """
 from __future__ import annotations
 
 import json
 import threading
 import time
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 
 from .base_client import LLMClient, LLMResponse, ToolCall
 
 
 # ── 格式转换工具函数 ───────────────────────────────────────────────────────
-# (保持不变)
+
 def _to_openai_messages(messages: list[dict]) -> list[dict]:
     result = []
     for msg in messages:
@@ -66,6 +64,7 @@ def _to_openai_messages(messages: list[dict]) -> list[dict]:
             result.append(msg)
     return result
 
+
 def _to_openai_tools(tools: list[dict]) -> list[dict]:
     result = []
     for tool in tools:
@@ -82,6 +81,7 @@ def _to_openai_tools(tools: list[dict]) -> list[dict]:
             })
     return result
 
+
 def _parse_tool_buffers(tool_buffers: dict[str, dict]) -> list[ToolCall]:
     tool_calls = []
     for tid, tdata in tool_buffers.items():
@@ -93,73 +93,21 @@ def _parse_tool_buffers(tool_buffers: dict[str, dict]) -> list[ToolCall]:
     return tool_calls
 
 
-# ── 智谱 GLM 定价逻辑更新 ────────────────────────────────────────────────────────
-# 价格单位：元 / 1M tokens
-# 结构：{
-#     "model_name": {
-#         input_tier: { output_tier: (input_price, output_price) }
-#     }
-# }
-# input_tier: 0 代表 [0, 32k), 1 代表 [32k+)
-# output_tier: 0 代表 [0, 0.2k), 1 代表 [0.2k+)
+# ── OpenAI 兼容客户端 ───────────────────────────────────────────────────────
 
-_ZHIPU_PRICING_TIERED = {
-    "glm-5": {
-        0: {0: (4, 18), 1: (4, 18)}, # 输出无论长短，价格一致
-        1: {0: (6, 22), 1: (6, 22)}
-    },
-    "glm-5-code": {
-        0: {0: (6, 28), 1: (6, 28)},
-        1: {0: (8, 32), 1: (8, 32)}
-    },
-    "glm-4.7": {
-        # 输入 < 32k
-        0: {
-            0: (2, 8),   # 输出 < 0.2k
-            1: (2, 14)   # 输出 >= 0.2k
-        },
-        # 输入 >= 32k (表格显示 32-200k 范围，暂按此处理)
-        1: {
-            0: (4, 16),
-            1: (4, 16)
-        }
-    },
-    "glm-4.5-air": {
-        0: {
-            0: (0.8, 2),
-            1: (0.8, 6)  # 输出 >= 0.2k 价格不同
-        },
-        1: { # 输入 32-128k
-            0: (1.2, 8),
-            1: (1.2, 8)
-        }
-    },
-    "glm-4.7-flashx": {
-        # 200K 上下文，表格未明确区分输入阶梯，统一价
-        0: {0: (0.5, 3), 1: (0.5, 3)},
-        1: {0: (0.5, 3), 1: (0.5, 3)}
-    },
-    "glm-4.7-flash": {
-        0: {0: (0.0, 0.0), 1: (0.0, 0.0)}, # 免费
-        1: {0: (0.0, 0.0), 1: (0.0, 0.0)}
-    },
-    "default": { # 默认回退价格
-        0: {0: (1.0, 4.0), 1: (1.0, 4.0)},
-        1: {0: (1.0, 4.0), 1: (1.0, 4.0)}
-    }
-}
+class OpenAIClient(LLMClient):
+    """OpenAI Chat Completions 兼容客户端。
 
-class ZhipuLLMClient(LLMClient):
-    """智谱 AI (GLM) 客户端，兼容 OpenAI SSE 协议。"""
+    通过配置 base_url 和 api_key，可对接任意兼容 OpenAI 协议的服务。
+    """
 
     def __init__(
         self,
-        model: str = "glm-4.7",
+        model: str = "gpt-4o",
         api_key: Optional[str] = None,
         max_tokens: int = 8192,
         temperature: float = 1.0,
-        base_url: str = "https://open.bigmodel.cn/api/paas/v4",
-        enable_thinking: bool = True,
+        base_url: str = "https://api.openai.com/v1",
         history_file: Optional[str] = None,
     ) -> None:
         super().__init__(history_file=history_file)
@@ -167,14 +115,13 @@ class ZhipuLLMClient(LLMClient):
         if not api_key:
             raise ValueError(
                 "api_key 不能为空。请在 config.yaml 填写 api_key，"
-                "或设置环境变量 ZHIPU_API_KEY。"
+                "或设置环境变量 OPENAI_API_KEY。"
             )
-        self.model = model.lower() # 统一转小写匹配 key
+        self.model = model
         self.api_key = api_key
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.base_url = base_url.rstrip("/")
-        self.enable_thinking = enable_thinking
 
     def _build_headers(self) -> dict:
         return {
@@ -193,7 +140,7 @@ class ZhipuLLMClient(LLMClient):
         except Exception:
             code = response.status_code
             msg = response.text[:200]
-        raise RuntimeError(f"智谱 API 错误 [{code}]: {msg}")
+        raise RuntimeError(f"API 错误 [{code}]: {msg}")
 
     def _stream_chat_impl(
         self,
@@ -219,12 +166,10 @@ class ZhipuLLMClient(LLMClient):
             "temperature": self.temperature,
             "stream": True,
         }
-        if self.enable_thinking:
-            payload["thinking"] = {"type": "enabled"}
         if tools:
             payload["tools"] = _to_openai_tools(tools)
             payload["tool_choice"] = "auto"
-            payload["parallel_tool_calls"] = False  # 每次只返回一个工具调用，串行执行
+            payload["parallel_tool_calls"] = False
 
         text_buffer = ""
         tool_buffers: dict[str, dict] = {}
@@ -232,7 +177,7 @@ class ZhipuLLMClient(LLMClient):
             "input_tokens": 0,
             "output_tokens": 0,
             "reasoning_tokens": 0,
-            "cached_tokens": 0
+            "cached_tokens": 0,
         }
         stop_reason = "stop"
 
@@ -246,7 +191,6 @@ class ZhipuLLMClient(LLMClient):
             ) as r:
                 self._raise_for_api_error(r)
 
-                # index → 首块时确立的 tool_id（解决后续块 id=null 的分裂问题）
                 index_to_id: dict[int, str] = {}
 
                 for raw_line in r.iter_lines():
@@ -255,7 +199,6 @@ class ZhipuLLMClient(LLMClient):
                     if not raw_line:
                         continue
                     line = raw_line.decode("utf-8").strip()
-                    # 兼容 "data: " 和 "data:" 两种格式
                     if line.startswith("data:"):
                         data_str = line[5:].strip()
                     else:
@@ -270,12 +213,11 @@ class ZhipuLLMClient(LLMClient):
                     if "error" in chunk:
                         err = chunk["error"]
                         raise RuntimeError(
-                            f"智谱 API 流式错误 [{err.get('code', '?')}]: {err.get('message', '')}"
+                            f"API 流式错误 [{err.get('code', '?')}]: {err.get('message', '')}"
                         )
 
                     choices = chunk.get("choices") or []
                     if not choices:
-                        # 可能是末尾 usage-only chunk
                         u = chunk.get("usage")
                         if u:
                             usage["input_tokens"] = u.get("prompt_tokens", 0)
@@ -291,7 +233,6 @@ class ZhipuLLMClient(LLMClient):
                     text_delta = delta.get("content")
                     if text_delta:
                         text_buffer += text_delta
-                        # 取消后不再回调，防止乱码写入界面
                         if on_text and not (cancel_event and cancel_event.is_set()):
                             on_text(text_delta)
 
@@ -299,7 +240,6 @@ class ZhipuLLMClient(LLMClient):
                         index = tc.get("index", 0)
                         func = tc.get("function") or {}
                         if index not in index_to_id:
-                            # 首块：用 id 字段建立 buffer，id 缺失时用 index 兜底
                             tool_id = tc.get("id") or f"tool_{index}"
                             index_to_id[index] = tool_id
                             tool_buffers[tool_id] = {
@@ -309,7 +249,6 @@ class ZhipuLLMClient(LLMClient):
                             if on_tool_start:
                                 on_tool_start(tool_buffers[tool_id]["name"], tool_id)
                         else:
-                            # 后续块：id=null，通过 index 找回正确 buffer
                             tool_id = index_to_id[index]
                         tool_buffers[tool_id]["input_json"] += func.get("arguments") or ""
 
@@ -328,7 +267,7 @@ class ZhipuLLMClient(LLMClient):
         except RuntimeError:
             raise
         except Exception as e:
-            raise RuntimeError(f"智谱 API 请求失败: {e}") from e
+            raise RuntimeError(f"API 请求失败: {e}") from e
 
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
         return LLMResponse(
@@ -337,11 +276,7 @@ class ZhipuLLMClient(LLMClient):
             stop_reason=stop_reason,
             usage=usage,
             elapsed_ms=elapsed_ms,
-            cost_usd=self.calc_cost(
-                usage["input_tokens"],
-                usage["output_tokens"],
-                reasoning_tokens=usage["reasoning_tokens"]
-            ),
+            cost_usd=0.0,
         )
 
     def chat(
@@ -367,12 +302,10 @@ class ZhipuLLMClient(LLMClient):
             "temperature": self.temperature,
             "stream": False,
         }
-        if self.enable_thinking:
-            payload["thinking"] = {"type": "enabled"}
         if tools:
             payload["tools"] = _to_openai_tools(tools)
             payload["tool_choice"] = "auto"
-            payload["parallel_tool_calls"] = False  # 每次只返回一个工具调用，串行执行
+            payload["parallel_tool_calls"] = False
 
         try:
             r = requests.post(
@@ -386,7 +319,7 @@ class ZhipuLLMClient(LLMClient):
         except RuntimeError:
             raise
         except Exception as e:
-            raise RuntimeError(f"智谱 API 请求失败: {e}") from e
+            raise RuntimeError(f"API 请求失败: {e}") from e
 
         choice = body.get("choices", [{}])[0]
         message = choice.get("message", {})
@@ -397,14 +330,11 @@ class ZhipuLLMClient(LLMClient):
         output_details = usage_raw.get("completion_tokens_details", {})
         prompt_details = usage_raw.get("prompt_tokens_details", {})
 
-        reasoning_tokens = output_details.get("reasoning_tokens", 0)
-        cached_tokens = prompt_details.get("cached_tokens", 0)
-
         usage = {
             "input_tokens": usage_raw.get("prompt_tokens", 0),
             "output_tokens": usage_raw.get("completion_tokens", 0),
-            "reasoning_tokens": reasoning_tokens,
-            "cached_tokens": cached_tokens,
+            "reasoning_tokens": output_details.get("reasoning_tokens", 0),
+            "cached_tokens": prompt_details.get("cached_tokens", 0),
         }
 
         tool_calls = []
@@ -427,11 +357,7 @@ class ZhipuLLMClient(LLMClient):
             stop_reason=stop_reason,
             usage=usage,
             elapsed_ms=elapsed_ms,
-            cost_usd=self.calc_cost(
-                usage["input_tokens"],
-                usage["output_tokens"],
-                reasoning_tokens=usage["reasoning_tokens"]
-            ),
+            cost_usd=0.0,
         )
         self._record_response(response)
         return response
@@ -443,42 +369,3 @@ class ZhipuLLMClient(LLMClient):
             if isinstance(content, str):
                 total_chars += len(content)
         return total_chars // 4 + 10
-
-    def calc_cost(
-        self,
-        input_tokens: int,
-        output_tokens: int,
-        reasoning_tokens: int = 0
-    ) -> float:
-        """
-        根据智谱最新价格表计算成本。
-        支持 GLM-5, GLM-4.7, GLM-4.5-Air 等模型的阶梯定价。
-        """
-        # 1. 获取模型价格表
-        pricing_model = _ZHIPU_PRICING_TIERED.get(self.model, _ZHIPU_PRICING_TIERED["default"])
-
-        # 2. 确定输入阶梯
-        # 表格中 [0, 32) 单位为 K，即 [0, 32000)
-        if input_tokens < 32000:
-            input_tier = 0
-        else:
-            input_tier = 1
-
-        # 3. 确定输出阶梯
-        # 表格中 [0, 0.2) 单位为 K，即 [0, 200)
-        # reasoning_tokens 计入总输出，决定是否触发高价档位
-        total_output = output_tokens + reasoning_tokens
-
-        if total_output < 200:
-            output_tier = 0
-        else:
-            output_tier = 1
-
-        # 4. 获取单价 (元 / 1M tokens)
-        input_price, output_price = pricing_model.get(input_tier, pricing_model[0])[output_tier]
-
-        # 5. 计算最终费用
-        # 注意：价格表是元/百万tokens，所以除以 1,000,000
-        cost = (input_tokens * input_price + total_output * output_price) / 1_000_000
-
-        return cost

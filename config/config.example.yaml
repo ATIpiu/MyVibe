@@ -1,19 +1,19 @@
 llm:
-  provider: zhipu                        # 支持 zhipu（默认）或 anthropic
-  model: glm-4-flash                     # 模型名称，如 glm-4.7 / glm-4-flash / claude-sonnet-4-6
-  api_key: "YOUR_API_KEY_HERE"           # 优先读取环境变量 ZHIPU_API_KEY / GLM_API_KEY / ANTHROPIC_API_KEY
-  base_url: "https://open.bigmodel.cn/api/paas/v4"  # 智谱 API 地址；Anthropic 可留空
+  provider: openai                       # 支持所有兼容 OpenAI Chat Completions 协议的服务
+  model: gpt-4o                          # 模型名称，按所用服务填写
+  api_key: "YOUR_API_KEY_HERE"           # 或设置环境变量 OPENAI_API_KEY
+  base_url: "https://api.openai.com/v1"  # 兼容 OpenAI 协议的任意服务地址
   max_tokens: 8192
   temperature: 1.0
-  history_file: "logs/conversation_history.jsonl"   # 对话历史持久化路径（相对于运行目录）
+  history_file: "logs/conversation_history.jsonl"
 
 agent:
-  max_tool_workers: 4            # ThreadPoolExecutor 并行工具数
-  context_compress_threshold: 0.92   # token 占比超过此值时压缩
-  compress_keep_recent: 10       # 压缩后保留最近 N 轮
+  max_tool_workers: 4
+  context_compress_threshold: 0.92
+  compress_keep_recent: 10
+  model_routing: false               # 是否按任务类型自动切换模型，关闭则始终使用 llm.model
 
 permissions:
-  # 自动允许（无需确认）
   auto_allow:
     - read_file
     - search_in_file
@@ -23,13 +23,11 @@ permissions:
     - get_function_code
     - index_project
     - search_functions
-  # 需要用户确认
   require_confirm:
     - write_file
     - edit_file
     - shell
     - git_commit
-  # 永久拒绝
   deny:
     - "rm -rf /"
     - "format"
@@ -41,7 +39,7 @@ shell:
     - "dd if=/dev/zero"
     - "mkfs"
     - "> /dev/sda"
-  timeout_ms: 120000             # 默认命令超时 2 分钟
+  timeout_ms: 120000
 
 logging:
   level: INFO
