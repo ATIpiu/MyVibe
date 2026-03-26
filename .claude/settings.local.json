@@ -7,7 +7,9 @@
       "Bash(git check-ignore:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(cd \"C:/Users/15227/PycharmProjects/MyVibe/MyVibe\" && pip show myvibe 2>&1 | head -10)"
+      "Bash(cd \"C:/Users/15227/PycharmProjects/MyVibe/MyVibe\" && pip show myvibe 2>&1 | head -10)",
+      "Bash(ls C:/Users/15227/PycharmProjects/MyVibe/MyVibe/src/llm/*.py)",
+      "Bash(python3 -c \"\nwith open\\('C:/Users/15227/PycharmProjects/MyVibe/MyVibe/config/config.yaml', 'r', encoding='utf-8'\\) as f:\n    print\\(repr\\(f.read\\(\\)[:200]\\)\\)\n\")"
     ]
   }
 }
