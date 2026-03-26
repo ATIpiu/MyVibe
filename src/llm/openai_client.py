@@ -2,6 +2,11 @@
 
 适用于所有兼容 OpenAI Chat Completions API 的服务（OpenAI、智谱、DeepSeek 等）。
 依赖 base_client.LLMClient，支持流式 + 非流式调用。
+
+重试策略：
+  - 最多重试 3 次，指数退避 1s → 2s → 4s
+  - 可重试：ChunkedEncodingError / ConnectionError / Timeout / 其他非 API 错误
+  - 不重试：RuntimeError（由 _raise_for_api_error 抛出的 4xx/5xx API 错误）
 """
 from __future__ import annotations
 
@@ -11,6 +16,26 @@ import time
 from typing import Callable, Optional
 
 from .base_client import LLMClient, LLMResponse, ToolCall
+
+
+_MAX_RETRIES = 3
+_RETRY_DELAYS = [1, 2, 4]  # 指数退避秒数
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """判断异常是否值得重试。RuntimeError 是 API 层错误（4xx/5xx），不重试。"""
+    if isinstance(exc, RuntimeError):
+        return False
+    try:
+        import requests.exceptions
+        return isinstance(exc, (
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ReadTimeout,
+        ))
+    except ImportError:
+        return True  # requests 未安装时兜底重试
 
 
 # ── 格式转换工具函数 ───────────────────────────────────────────────────────
@@ -165,59 +190,105 @@ class OpenAIClient(LLMClient):
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             payload["tools"] = _to_openai_tools(tools)
             payload["tool_choice"] = "auto"
             payload["parallel_tool_calls"] = False
 
-        text_buffer = ""
-        tool_buffers: dict[str, dict] = {}
-        usage = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "reasoning_tokens": 0,
-            "cached_tokens": 0,
-        }
-        stop_reason = "stop"
+        last_exc: Exception = RuntimeError("未知错误")
 
-        try:
-            with requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=self._build_headers(),
-                json=payload,
-                stream=True,
-                timeout=180,
-            ) as r:
-                self._raise_for_api_error(r)
+        for attempt in range(_MAX_RETRIES + 1):
+            # 每次重试前重置所有缓冲区
+            text_buffer = ""
+            tool_buffers: dict[str, dict] = {}
+            usage = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+            }
+            stop_reason = "stop"
 
-                index_to_id: dict[int, str] = {}
+            # 重试时不回调 on_text，避免终端输出重复内容
+            _on_text = on_text if attempt == 0 else None
+            _on_tool_start = on_tool_start if attempt == 0 else None
 
-                for raw_line in r.iter_lines():
-                    if cancel_event and cancel_event.is_set():
-                        break
-                    if not raw_line:
-                        continue
-                    line = raw_line.decode("utf-8").strip()
-                    if line.startswith("data:"):
-                        data_str = line[5:].strip()
-                    else:
-                        continue
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+            try:
+                with requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self._build_headers(),
+                    json=payload,
+                    stream=True,
+                    timeout=180,
+                ) as r:
+                    self._raise_for_api_error(r)
 
-                    if "error" in chunk:
-                        err = chunk["error"]
-                        raise RuntimeError(
-                            f"API 流式错误 [{err.get('code', '?')}]: {err.get('message', '')}"
-                        )
+                    index_to_id: dict[int, str] = {}
 
-                    choices = chunk.get("choices") or []
-                    if not choices:
+                    for raw_line in r.iter_lines():
+                        if cancel_event and cancel_event.is_set():
+                            break
+                        if not raw_line:
+                            continue
+                        line = raw_line.decode("utf-8").strip()
+                        if line.startswith("data:"):
+                            data_str = line[5:].strip()
+                        else:
+                            continue
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if "error" in chunk:
+                            err = chunk["error"]
+                            raise RuntimeError(
+                                f"API 流式错误 [{err.get('code', '?')}]: {err.get('message', '')}"
+                            )
+
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            u = chunk.get("usage")
+                            if u:
+                                usage["input_tokens"] = u.get("prompt_tokens", 0)
+                                usage["output_tokens"] = u.get("completion_tokens", 0)
+                                details = (u.get("completion_tokens_details") or {})
+                                usage["reasoning_tokens"] = details.get("reasoning_tokens", 0)
+                                prompt_details = (u.get("prompt_tokens_details") or {})
+                                usage["cached_tokens"] = prompt_details.get("cached_tokens", 0)
+                            continue
+
+                        choice = choices[0]
+                        delta = choice.get("delta", {})
+                        text_delta = delta.get("content")
+                        if text_delta:
+                            text_buffer += text_delta
+                            if _on_text and not (cancel_event and cancel_event.is_set()):
+                                _on_text(text_delta)
+
+                        for tc in delta.get("tool_calls") or []:
+                            index = tc.get("index", 0)
+                            func = tc.get("function") or {}
+                            if index not in index_to_id:
+                                tool_id = tc.get("id") or f"tool_{index}"
+                                index_to_id[index] = tool_id
+                                tool_buffers[tool_id] = {
+                                    "name": func.get("name") or "",
+                                    "input_json": "",
+                                }
+                                if _on_tool_start:
+                                    _on_tool_start(tool_buffers[tool_id]["name"], tool_id)
+                            else:
+                                tool_id = index_to_id[index]
+                            tool_buffers[tool_id]["input_json"] += func.get("arguments") or ""
+
+                        if choice.get("finish_reason"):
+                            stop_reason = choice["finish_reason"]
+
                         u = chunk.get("usage")
                         if u:
                             usage["input_tokens"] = u.get("prompt_tokens", 0)
@@ -226,48 +297,29 @@ class OpenAIClient(LLMClient):
                             usage["reasoning_tokens"] = details.get("reasoning_tokens", 0)
                             prompt_details = (u.get("prompt_tokens_details") or {})
                             usage["cached_tokens"] = prompt_details.get("cached_tokens", 0)
-                        continue
 
-                    choice = choices[0]
-                    delta = choice.get("delta", {})
-                    text_delta = delta.get("content")
-                    if text_delta:
-                        text_buffer += text_delta
-                        if on_text and not (cancel_event and cancel_event.is_set()):
-                            on_text(text_delta)
+                # 成功，跳出重试循环
+                break
 
-                    for tc in delta.get("tool_calls") or []:
-                        index = tc.get("index", 0)
-                        func = tc.get("function") or {}
-                        if index not in index_to_id:
-                            tool_id = tc.get("id") or f"tool_{index}"
-                            index_to_id[index] = tool_id
-                            tool_buffers[tool_id] = {
-                                "name": func.get("name") or "",
-                                "input_json": "",
-                            }
-                            if on_tool_start:
-                                on_tool_start(tool_buffers[tool_id]["name"], tool_id)
-                        else:
-                            tool_id = index_to_id[index]
-                        tool_buffers[tool_id]["input_json"] += func.get("arguments") or ""
-
-                    if choice.get("finish_reason"):
-                        stop_reason = choice["finish_reason"]
-
-                    u = chunk.get("usage")
-                    if u:
-                        usage["input_tokens"] = u.get("prompt_tokens", 0)
-                        usage["output_tokens"] = u.get("completion_tokens", 0)
-                        details = (u.get("completion_tokens_details") or {})
-                        usage["reasoning_tokens"] = details.get("reasoning_tokens", 0)
-                        prompt_details = (u.get("prompt_tokens_details") or {})
-                        usage["cached_tokens"] = prompt_details.get("cached_tokens", 0)
-
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"API 请求失败: {e}") from e
+            except RuntimeError:
+                raise  # API 层错误（4xx/5xx），直接抛出不重试
+            except Exception as e:
+                last_exc = e
+                if not _is_retryable(e):
+                    raise RuntimeError(f"API 请求失败: {e}") from e
+                if attempt < _MAX_RETRIES:
+                    delay = _RETRY_DELAYS[attempt]
+                    print(
+                        f"\n[重试 {attempt + 1}/{_MAX_RETRIES}] 网络中断（{type(e).__name__}），"
+                        f"{delay}s 后重试...",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    # 重试时补回 on_text 输出（从头重新流式打印）
+                    _on_text = on_text
+                    _on_tool_start = on_tool_start
+                else:
+                    raise RuntimeError(f"API 请求失败（已重试 {_MAX_RETRIES} 次）: {last_exc}") from last_exc
 
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
         return LLMResponse(
@@ -307,19 +359,36 @@ class OpenAIClient(LLMClient):
             payload["tool_choice"] = "auto"
             payload["parallel_tool_calls"] = False
 
-        try:
-            r = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=self._build_headers(),
-                json=payload,
-                timeout=180,
-            )
-            self._raise_for_api_error(r)
-            body = r.json()
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"API 请求失败: {e}") from e
+        last_exc: Exception = RuntimeError("未知错误")
+        body: dict = {}
+
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                r = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self._build_headers(),
+                    json=payload,
+                    timeout=180,
+                )
+                self._raise_for_api_error(r)
+                body = r.json()
+                break  # 成功
+            except RuntimeError:
+                raise
+            except Exception as e:
+                last_exc = e
+                if not _is_retryable(e):
+                    raise RuntimeError(f"API 请求失败: {e}") from e
+                if attempt < _MAX_RETRIES:
+                    delay = _RETRY_DELAYS[attempt]
+                    print(
+                        f"\n[重试 {attempt + 1}/{_MAX_RETRIES}] 网络中断（{type(e).__name__}），"
+                        f"{delay}s 后重试...",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                else:
+                    raise RuntimeError(f"API 请求失败（已重试 {_MAX_RETRIES} 次）: {last_exc}") from last_exc
 
         choice = body.get("choices", [{}])[0]
         message = choice.get("message", {})

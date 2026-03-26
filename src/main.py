@@ -1163,6 +1163,13 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
 
                 print()
 
+                # LLM 主动调用 exit_plan_mode → 直接跳到计划完成处理
+                if plan_agent.exit_requested:
+                    _pending_input = _handle_plan_complete(
+                        agent, plan_agent, plan_text, plan_file, console, prompt_session
+                    )
+                    continue
+
                 # Q&A 轮次：若输出含待确认问题，逐题交互后再投回 PlanAgent
                 MAX_QA = 6
                 for _ in range(MAX_QA):
