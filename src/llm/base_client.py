@@ -176,13 +176,25 @@ class LLMClient(abc.ABC):
     def _now_iso() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
+    @staticmethod
+    def _sanitize_for_json(obj):
+        """递归净化字典/列表/字符串中的孤立代理字符，确保 JSON 序列化不崩溃。"""
+        if isinstance(obj, str):
+            return obj.encode("utf-8", errors="replace").decode("utf-8")
+        if isinstance(obj, dict):
+            return {k: LLMClient._sanitize_for_json(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [LLMClient._sanitize_for_json(i) for i in obj]
+        return obj
+
     def _append_entry(self, entry: HistoryEntry) -> None:
         """写入内存列表并追加到 JSONL 文件。"""
         self.history.append(entry)
         if self._history_file:
             try:
+                safe = self._sanitize_for_json(entry.to_dict())
                 with open(self._history_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
+                    f.write(json.dumps(safe, ensure_ascii=False) + "\n")
             except Exception as exc:
                 # 历史写入失败不阻断主流程
                 print(f"[LLMClient] 历史写入失败: {exc}")

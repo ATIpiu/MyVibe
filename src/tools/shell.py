@@ -10,8 +10,18 @@ from typing import Callable, Optional
 from .base_tool import BaseTool, ToolRegistry, ToolResult
 
 
+def _sanitize_surrogates(s: str) -> str:
+    """移除字符串中的孤立代理字符（lone surrogates）。
+
+    Windows 下某些 emoji 或特殊字节被错误解码后会产生 U+D800-U+DFFF 范围内的
+    孤立代理字符，Python 的 UTF-8 编码器不接受这类字符，写入文件/JSON 时会崩溃。
+    用 replace 模式重新编解码可将其替换为 U+FFFD（替换字符）。
+    """
+    return s.encode("utf-8", errors="replace").decode("utf-8")
+
+
 def _decode_output(data: bytes) -> str:
-    """解码命令输出字节流，依次尝试 UTF-8 / GBK / latin-1。
+    """解码命令输出字节流，依次尝试 UTF-8 / GBK / latin-1，并净化孤立代理字符。
 
     Windows cmd 默认使用 GBK（CP936），直接以 utf-8 解码会导致乱码；
     依序尝试多种编码并 fallback 到 latin-1（永不失败）确保输出可读。
@@ -21,10 +31,10 @@ def _decode_output(data: bytes) -> str:
     candidates = ["utf-8", "gbk", "latin-1"]
     for enc in candidates:
         try:
-            return data.decode(enc)
+            return _sanitize_surrogates(data.decode(enc))
         except UnicodeDecodeError:
             continue
-    return data.decode("utf-8", errors="replace")
+    return _sanitize_surrogates(data.decode("utf-8", errors="replace"))
 
 # 危险命令默认模式（可由配置覆盖）
 DEFAULT_DANGEROUS_PATTERNS = [

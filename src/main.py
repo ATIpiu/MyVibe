@@ -1001,6 +1001,12 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
         from prompt_toolkit import PromptSession
         from prompt_toolkit.history import FileHistory
         from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+
+        class _SafeFileHistory(FileHistory):
+            """FileHistory 子类：写入前净化孤立代理字符，防止 Windows 下 UTF-8 编码崩溃。"""
+            def store_string(self, string: str) -> None:
+                safe = string.encode("utf-8", errors="replace").decode("utf-8")
+                super().store_string(safe)
         from prompt_toolkit.formatted_text import HTML
         from prompt_toolkit.key_binding import KeyBindings
         from src.completer.multi_completer import MultiCompleter
@@ -1071,7 +1077,7 @@ def run_interactive_loop(agent: CodingAgent, session_manager: SessionManager, cw
                 pass
 
         prompt_session = PromptSession(
-            history=FileHistory(str(history_file)),
+            history=_SafeFileHistory(str(history_file)),
             completer=completer,
             auto_suggest=AutoSuggestFromHistory(),
             complete_while_typing=True,
