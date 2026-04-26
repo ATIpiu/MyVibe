@@ -2,7 +2,9 @@
 
 精简原则：
   - 只提取 qualname、purpose（docstring 第一行）
-  - 嵌套函数（定义在函数内部的函数）不收录
+  - 嵌套函数/类（定义在函数或类内部）以 dotted qualname 索引，例如
+    ``lazy.__proxy__``、``lazy.__proxy__.__init__``、``Foo.bar.helper``
+  - ClassDef 自身也作为条目（取 class docstring 作 purpose）
   - 调用关系以 calls_map 独立返回，不存入 FunctionData
 """
 from __future__ import annotations
@@ -39,7 +41,7 @@ class AstAnalyzer:
 
         functions: dict[str, FunctionData] = {}
         calls_map: dict[str, list[str]] = {}
-        _collect_functions(tree, rel_path, imports, functions, calls_map, class_name="")
+        _collect_functions(tree, rel_path, imports, functions, calls_map, parent_qual="")
 
         module_docstring = ast.get_docstring(tree) or ""
         purpose = module_docstring.split("\n")[0].strip() if module_docstring else ""
@@ -54,26 +56,22 @@ class AstAnalyzer:
         except (OSError, SyntaxError):
             return {}
         ranges: dict[str, tuple[int, int]] = {}
-        _collect_ranges(tree, ranges, class_name="")
+        _collect_ranges(tree, ranges, parent_qual="")
         return ranges
 
     def get_function_source(self, file_path: Path, qualname: str) -> Optional[str]:
-        """精确提取指定函数/方法的完整源码。"""
+        """精确提取指定函数/类/方法的完整源码（支持任意深度 dotted qualname）。"""
         source = file_path.read_text(encoding="utf-8", errors="replace")
         try:
             tree = ast.parse(source)
         except SyntaxError:
             return None
 
-        parts = qualname.split(".")
-        func_name = parts[-1]
-        class_name = parts[0] if len(parts) > 1 else ""
-
-        lines = source.splitlines()
-        node = _find_function_node(tree, func_name, class_name)
+        node = _find_function_node(tree, qualname)
         if node is None:
             return None
 
+        lines = source.splitlines()
         start = node.lineno - 1
         end = node.end_lineno if hasattr(node, "end_lineno") else _estimate_end(lines, start)
         return "\n".join(lines[start:end])
@@ -88,19 +86,34 @@ def _collect_functions(
     imports: dict[str, str],
     functions: dict[str, FunctionData],
     calls_map: dict[str, list[str]],
-    class_name: str,
+    parent_qual: str,
 ) -> None:
-    """收集顶层函数及类方法（不递归进函数内部，嵌套函数不收录）。"""
+    """递归收集所有 class/function 定义，使用 dotted qualname。
+
+    嵌套规则：
+      - 顶层 ``def foo``：``foo``
+      - 类方法 ``class Foo: def bar``：``Foo.bar``
+      - 嵌套类 ``def lazy(): class __proxy__``：``lazy.__proxy__``
+      - 嵌套类方法：``lazy.__proxy__.__init__``
+      - ClassDef 自身也作为条目（purpose = class docstring）
+    """
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
-            _collect_functions(node, module_path, imports, functions, calls_map, node.name)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            qualname = f"{class_name}.{node.name}" if class_name else node.name
+            qual = f"{parent_qual}.{node.name}" if parent_qual else node.name
             docstring = ast.get_docstring(node) or ""
             purpose = docstring.split("\n")[0].strip() if docstring else ""
-            functions[qualname] = FunctionData(purpose=purpose)
-            # 提取该函数的调用关系（不进入嵌套函数体）
-            calls_map[qualname] = _extract_calls(node, imports, module_path)
+            functions[qual] = FunctionData(purpose=purpose)
+            # class 自身不收 calls（其 body 由内部方法各自记录）
+            calls_map.setdefault(qual, [])
+            _collect_functions(node, module_path, imports, functions, calls_map, qual)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            qual = f"{parent_qual}.{node.name}" if parent_qual else node.name
+            docstring = ast.get_docstring(node) or ""
+            purpose = docstring.split("\n")[0].strip() if docstring else ""
+            functions[qual] = FunctionData(purpose=purpose)
+            calls_map[qual] = _extract_calls(node, imports, module_path)
+            # 递归找函数体内的嵌套 class / 嵌套函数（_extract_calls 会跳过这些）
+            _collect_functions(node, module_path, imports, functions, calls_map, qual)
 
 
 def _extract_calls(
@@ -155,28 +168,37 @@ def _extract_imports(tree: ast.AST) -> dict[str, str]:
     return mapping
 
 
-def _find_function_node(
-    tree: ast.AST, func_name: str, class_name: str
-) -> Optional[ast.FunctionDef]:
-    for node in ast.walk(tree):
-        if class_name and isinstance(node, ast.ClassDef) and node.name == class_name:
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if child.name == func_name:
-                        return child
-        elif not class_name and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name == func_name:
-                return node
+def _find_function_node(tree: ast.AST, qualname: str) -> Optional[ast.AST]:
+    """根据 dotted qualname 在 AST 中精确定位（支持任意深度嵌套）。
+
+    例如 ``lazy.__proxy__.__init__`` 会按 ``lazy`` → ``__proxy__`` → ``__init__``
+    逐级下钻，每层匹配 FunctionDef / AsyncFunctionDef / ClassDef 子节点。
+    """
+    parts = qualname.split(".") if qualname else []
+    if not parts:
+        return None
+    return _descend(tree, parts)
+
+
+def _descend(node: ast.AST, parts: list[str]) -> Optional[ast.AST]:
+    target, rest = parts[0], parts[1:]
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if child.name == target:
+                if not rest:
+                    return child
+                hit = _descend(child, rest)
+                if hit is not None:
+                    return hit
     return None
 
 
-def _collect_ranges(tree: ast.AST, ranges: dict, class_name: str) -> None:
+def _collect_ranges(tree: ast.AST, ranges: dict, parent_qual: str) -> None:
     for node in ast.iter_child_nodes(tree):
-        if isinstance(node, ast.ClassDef):
-            _collect_ranges(node, ranges, class_name=node.name)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            qualname = f"{class_name}.{node.name}" if class_name else node.name
-            ranges[qualname] = (node.lineno, getattr(node, "end_lineno", node.lineno))
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            qual = f"{parent_qual}.{node.name}" if parent_qual else node.name
+            ranges[qual] = (node.lineno, getattr(node, "end_lineno", node.lineno))
+            _collect_ranges(node, ranges, qual)
 
 
 def _estimate_end(lines: list[str], start: int) -> int:

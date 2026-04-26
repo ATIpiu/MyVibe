@@ -6,7 +6,7 @@ from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
 
 try:
-    from src.memory.memory_manager import get_memory_manager
+    from src.tools.index.manager import get_index_manager
     MEMORY_AVAILABLE = True
 except ImportError:
     MEMORY_AVAILABLE = False
@@ -61,8 +61,8 @@ class SymbolCompleter(Completer):
     def _load_from_memory(self) -> None:
         """从项目记忆加载符号。"""
         try:
-            memory_manager = get_memory_manager(self.project_root)
-            all_memory = memory_manager.read_all()
+            index_manager = get_index_manager(self.project_root)
+            all_memory = index_manager.read_all()
             
             for module_path, module_data in all_memory.items():
                 # 提取函数符号

@@ -45,11 +45,12 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个专业的 AI 编程助手，运行在用
 ## 代码探索策略（重要）
 按以下顺序使用工具，从全局到精确：
 
-1. `read_memory(modules=[…])` → 某模块下的所有函数签名与描述
-2. `read_memory(function=…)`  → 指定函数完整源码 + callers + callees（通常这步就够了）
-3. `read_file`                → 仅当需要整个文件完整内容时调用
-4. `read_memory(all)`         → 全项目模块 + 函数列表一览(只有在需要了解整体项目的时候调用)
-5. `rebuild_memory`           → 初始化或重建记忆索引（首次使用或大量修改后）
+1. `read_file(scope='file', files=[…])` → 某模块下的所有函数签名与描述
+2. `read_file(scope='function', function_key=…)` → 指定函数完整源码 + callers + callees（通常这步就够了）
+3. `read_file(scope='overview')` → 全项目模块总览（只有在需要了解整体项目的时候调用）
+4. `find_symbol`              → 已知变量名/调用名时直接定位到 module:qualname
+5. `grep_files`               → 按字面量/正则在项目内搜索
+6. `rebuild_index`            → 初始化或重建代码索引（首次使用或大量修改后）
 
 ## 编码规范（必须遵守）
 新建 .py 文件时，**文件第一行必须是一句话模块说明**（docstring），供记忆系统索引：
@@ -65,10 +66,8 @@ def my_func(...):
 - 编辑文件：old_string 必须在文件中唯一出现，否则提供更多上下文
 - 执行命令：危险命令会触发权限确认，请提供清晰的 description 参数
 - 并行工具：无依赖关系的工具调用会并行执行，注意不要产生写冲突
-- 文件避免重复读取：read_file 工具在当前会话中已完整读取过的文件再次被调用时，
-  会自动返回"已在上下文"提示，无需再次读取。
-  如需了解特定函数，优先用 read_memory(scope='function', function_key=...)，
-  它直接返回函数源码 + 调用关系，通常比 read_file 更精准。
+- 代码定位优先用结构化索引：`read_file` / `find_symbol` 比按行读文件更精准，
+  能直接返回函数源码与调用关系。
 
 ## 输出风格
 - 保持简洁，直接给出结论和操作
@@ -84,7 +83,7 @@ PLAN_MODE_BLOCK = """
 ## 计划模式（已激活）
 
 > **工具限制**：当前只能使用只读工具（read_file / search_in_file / git_status / git_diff /
-> read_memory / lsp_hover 等），**禁止**调用 write_file / edit_file / shell / git_commit。
+> lsp_hover 等），**禁止**调用 write_file / edit_file / shell / git_commit。
 > 用户确认计划后，系统将自动解除限制并重新运行。
 
 收到用户任务后，请按以下步骤操作：

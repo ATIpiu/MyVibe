@@ -18,19 +18,22 @@ from ..llm.prompts import build_system_prompt, build_tool_descriptions
 from ..logger.structured_logger import StructuredLogger
 from ..tools.base_tool import ToolRegistry, ToolResult
 from ..tools.context_tools import set_context_manager
-from ..tools.memory_tools import set_memory_manager
-from ..tools.git import auto_commit_turn
-from ..memory.memory_manager import get_memory_manager
+from ..tools.index.tools import set_index_manager
+# 自动版本管理已下线：保留 git.py 模块定义，但不再每轮自动 commit。
+# 需要重启用时取消注释下一行 + run_turn 末尾对应调用。
+# from ..tools.git import auto_commit_turn
+from ..tools.index.manager import get_index_manager
 
 # 自动允许（无需确认）的工具列表（可由配置覆盖）
 DEFAULT_AUTO_ALLOW = {
     "read_file", "search_in_file", "glob_files", "grep_files",
     "git_status", "git_diff",
-    "read_memory", "lsp_hover",
+    "find_symbol", "lsp_hover",
     "ask_user",   # 询问用户 = 本身就是用户交互，无需二次确认
 }
 
 MODEL_MAX_TOKENS = 200_000
+
 
 
 class PermissionManager:
@@ -198,15 +201,14 @@ class CodingAgent(BaseAgent):
         # 注入全局 ContextManager
         set_context_manager(context_manager)
 
-        # 记忆管理器：单例 + 注入到 memory_tools
-        self._memory_manager = get_memory_manager(str(context_manager.project_root))
-        set_memory_manager(self._memory_manager)
+        # 代码索引管理器：单例 + 注入到 index tools
+        self._index_manager = get_index_manager(str(context_manager.project_root))
+        set_index_manager(self._index_manager)
 
         # 完整工具 schema（始终保留完整版，plan_mode 时动态过滤）
         # 追加 spawn_agent（不通过 ToolRegistry，由 handle_tool_calls 特殊处理）
         from ..tools.agent_tools import SPAWN_AGENT_SCHEMA
         self._tools_schema = ToolRegistry.all_tools_schema() + [SPAWN_AGENT_SCHEMA]
-
         # 中断信号：由外部（main loop）在 Ctrl+C 时 set()
         self._cancel = threading.Event()
         # 命名线程引用：退出前可 join 等待完成
@@ -262,8 +264,11 @@ class CodingAgent(BaseAgent):
         turn_total_cached = 0
         turn_total_reasoning = 0
         turn_total_cost = 0.0
-        MAX_ITERATIONS = 20  # 防止无限循环（降低上限减少 token 累积）
-        while iteration < MAX_ITERATIONS:
+        # 单 turn 内工具调用默认不设硬上限 —— runaway 应靠 context 压缩与用户的
+        # 取消信号兜底。用户可通过 config 里 agent.max_iterations 显式限制。
+        _max_iter_cfg = self.config.get("agent", {}).get("max_iterations")
+        MAX_ITERATIONS = int(_max_iter_cfg) if _max_iter_cfg is not None else None
+        while MAX_ITERATIONS is None or iteration < MAX_ITERATIONS:
             if self._cancel.is_set():
                 break
             iteration += 1
@@ -359,11 +364,14 @@ class CodingAgent(BaseAgent):
                 turn_total_input, turn_total_output, turn_total_cached,
                 turn_total_reasoning, turn_total_cost,
             )
-            commit_hash = auto_commit_turn(
-                self.state.cwd, self.state.turn, user_input, self.state.session_id
-            )
-            if commit_hash:
-                self.logger.log("git_auto_commit", {"turn": self.state.turn, "hash": commit_hash})
+            # 自动版本管理已下线 —— 不再每轮自动 commit。
+            # 需要重启用时恢复以下代码块（并取消顶部 import 注释）：
+            # commit_hash = auto_commit_turn(
+            #     self.state.cwd, self.state.turn, user_input, self.state.session_id
+            # )
+            # if commit_hash:
+            #     self.logger.log("git_auto_commit",
+            #                     {"turn": self.state.turn, "hash": commit_hash})
 
         # 恢复原始模型（路由仅作用于本轮）
         if _original_model is not None:
@@ -413,6 +421,23 @@ class CodingAgent(BaseAgent):
                     "content": result_text,
                     "is_error": False,
                 }
+
+            # read_file 已读检测：相同 (file_path, offset, limit) 且文件 mtime ≤ 上次
+            # 读取时刻 → 直接返回提示，避免把同一段内容塞回上下文浪费 token。
+            # offset/limit 任一不同则视作不同片段，正常读取。
+            if tool_name == "read_file":
+                _hit = self._check_read_file_already_read(args)
+                if _hit is not None:
+                    elapsed = int(time.monotonic() * 1000) - start_ms
+                    self.logger.tool_result(
+                        tool_name, tool_use_id, True, _hit[:80], elapsed, _hit
+                    )
+                    return idx, {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": _hit,
+                        "is_error": False,
+                    }
 
             # 权限检查
             description = args.get("description", "")
@@ -469,24 +494,6 @@ class CodingAgent(BaseAgent):
                 )
                 return idx, result.to_api_dict(tool_use_id)
 
-            # 已读文件拦截：避免重复 read_file，节省 token
-            if tool_name == "read_file":
-                file_path = args.get("file_path", "")
-                if file_path and self.state.is_file_read(file_path):
-                    msg = (
-                        f"文件 {file_path} 在本会话已完整读取过，无需重复读取。"
-                        "请直接基于上下文已有内容操作。"
-                        "如需查看特定函数详情，请用 read_memory(scope='function', function_key=...)"
-                    )
-                    elapsed = int(time.monotonic() * 1000) - start_ms
-                    self.logger.tool_result(tool_name, tool_use_id, True, msg[:80], elapsed, msg)
-                    return idx, {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": msg,
-                        "is_error": False,
-                    }
-
             try:
                 tool = ToolRegistry.instantiate(tool_name)
                 result = tool.execute(**args)
@@ -497,12 +504,9 @@ class CodingAgent(BaseAgent):
                     if file_path:
                         self.context_manager.invalidate(file_path)
 
-                # 只有 read_file 成功才标记文件已读（编辑≠读过）
+                # read_file 成功 → 记录 (file_path, offset, limit, read_time) + 统计
                 if tool_name == "read_file" and not result.is_error:
-                    self.state.mark_file_read(args.get("file_path", ""))
-
-                # 记忆工具调用：累计注入上下文的 token 量
-                if tool_name == "read_memory" and not result.is_error:
+                    self._record_read_file(args)
                     self.state.memory_tool_calls += 1
                     self.state.memory_tool_tokens += len(result.content or "") // 4
 
@@ -576,6 +580,94 @@ class CodingAgent(BaseAgent):
     def _render_tool_call(self, tool_name: str, args: dict) -> None:
         """（已在 logger.tool_call 中渲染，此处保留扩展点）"""
         pass
+
+    @staticmethod
+    def _normalize_read_file_key(args: dict) -> Optional[tuple[str, int, int]]:
+        """从 args 解出 (resolved_path, offset, limit)，失败返回 None。"""
+        fp = args.get("file_path", "")
+        if not fp:
+            return None
+        try:
+            from ..utils.path import safe_resolve
+            resolved = safe_resolve(fp)
+        except Exception:
+            return None
+        try:
+            off = int(args.get("offset", 1) or 1)
+            lim = int(args.get("limit", 2000) or 2000)
+        except (ValueError, TypeError):
+            return None
+        return str(resolved), off, lim
+
+    def _check_read_file_already_read(self, args: dict) -> Optional[str]:
+        """命中已读返回提示串；未命中返回 None。
+
+        命中条件：log 中存在精确匹配 (resolved_path, offset, limit) 的记录，
+        且当前文件 mtime ≤ 上次 read_time（即未被编辑过）。
+        """
+        key = self._normalize_read_file_key(args)
+        if key is None:
+            return None
+        resolved_str, off, lim = key
+        try:
+            from pathlib import Path
+            p = Path(resolved_str)
+            if not p.exists() or not p.is_file():
+                return None
+            mtime = p.stat().st_mtime
+        except Exception:
+            return None
+
+        # 取最近一次同 key 的记录
+        for record in reversed(self.state.read_file_log):
+            if (
+                record.get("file_path") == resolved_str
+                and record.get("offset") == off
+                and record.get("limit") == lim
+            ):
+                last_read = record.get("read_time", 0.0)
+                if mtime <= last_read:
+                    fmt = lambda ts: time.strftime(
+                        "%Y-%m-%d %H:%M:%S", time.localtime(ts)
+                    )
+                    return (
+                        f"[已读提示] 你已读过该文件的相同片段，且文件自上次读取后未被编辑：\n"
+                        f"  file_path = {args.get('file_path', '')}\n"
+                        f"  offset    = {off}\n"
+                        f"  limit     = {lim}\n"
+                        f"  上次读取 = {fmt(last_read)}\n"
+                        f"  文件 mtime = {fmt(mtime)}\n"
+                        f"内容已在之前的对话历史中，无需重复读取。"
+                        f"如需查看不同行段，请改变 offset/limit。"
+                    )
+                # 文件已编辑过 → 允许读
+                return None
+        return None
+
+    def _record_read_file(self, args: dict) -> None:
+        """记录一次成功的 read_file 调用，去重保留最新的同 key 记录。"""
+        key = self._normalize_read_file_key(args)
+        if key is None:
+            return
+        resolved_str, off, lim = key
+        # 去掉旧的同 key 记录，再追加新的（保持单条最新）
+        self.state.read_file_log = [
+            r for r in self.state.read_file_log
+            if not (
+                r.get("file_path") == resolved_str
+                and r.get("offset") == off
+                and r.get("limit") == lim
+            )
+        ]
+        self.state.read_file_log.append({
+            "file_path": resolved_str,
+            "offset": off,
+            "limit": lim,
+            "read_time": time.time(),
+        })
+        # 限长，避免会话长跑后无限增长
+        if len(self.state.read_file_log) > 200:
+            self.state.read_file_log = self.state.read_file_log[-200:]
 
     def _name_session_async(self) -> None:
         """子 Agent：根据第一条用户消息为会话命名。

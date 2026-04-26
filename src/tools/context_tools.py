@@ -1,7 +1,7 @@
 """上下文管理工具（内部模块，不再向 LLM 暴露工具）。
 
 原有 get_file_summary / get_function_code / index_project / search_functions
-已被 read_memory / rebuild_memory 替代，此处移除工具注册。
+已被 read_index / rebuild_index 替代，此处移除工具注册。
 set_context_manager / get_context_manager 保留供 coding_agent 内部使用。
 """
 from __future__ import annotations

@@ -31,12 +31,12 @@ import src.tools.shell         # noqa: F401
 import src.tools.git           # noqa: F401
 import src.tools.lsp           # noqa: F401
 import src.tools.context_tools  # noqa: F401
-import src.tools.memory_tools   # noqa: F401
 import src.tools.compile_tool   # noqa: F401
 import src.tools.ask_user_tool  # noqa: F401
+import src.tools.index.tools   # noqa: F401  代码索引工具（read_file / rebuild_index / find_symbol）
 
-from src.memory.memory_manager import get_memory_manager
-from src.tools.memory_tools import set_memory_manager
+from src.tools.index.manager import get_index_manager
+from src.tools.index.tools import set_index_manager
 from src.tools.lsp import set_lsp_root
 
 console = Console()
@@ -304,7 +304,7 @@ def handle_slash_command(
             # 把 init prompt 推入 pending_box，由主循环在后台线程执行，避免主线程死锁
             console.print("[bold cyan]正在初始化项目记忆，Agent 将主动探索项目结构...[/bold cyan]")
             _pending_box.append(init_prompt)
-        display_memory_stats(console, agent._memory_manager)
+        display_memory_stats(console, agent._index_manager)
         return True
 
     elif cmd == "/context":
@@ -504,7 +504,7 @@ def _show_context(console: Console, agent, cwd: str) -> None:
 
     # ── 5. 记忆系统统计 ──────────────────────────────────────────
     try:
-        all_memory = agent._memory_manager.read_all()
+        all_memory = agent._index_manager.read_all()
         total_modules = len(all_memory)
         total_funcs = sum(len(m.functions) for m in all_memory.values())
         mem_json = json.dumps(
@@ -532,7 +532,7 @@ def _show_context(console: Console, agent, cwd: str) -> None:
         "",
     )
     mem_table.add_row(
-        "本会话 read_memory",
+        "本会话 read_file",
         f"[dim]主动调用 {mem_tool_calls} 次，结果写入对话历史[/dim]",
         f"~{mem_tool_tokens:,} tokens" if mem_tool_calls > 0 else "[dim]0[/dim]",
     )
@@ -568,49 +568,49 @@ def display_welcome(
     console.print(Panel("\n".join(lines), border_style="cyan", expand=False))
 
 
-def sync_and_display_memory(console: Console, memory_manager) -> None:
+def sync_and_display_memory(console: Console, index_manager) -> None:
     """后台线程启动 AST 扫描，不阻塞交互循环，完成后打印统计。"""
     import json
 
     def _sync():
         try:
-            memory_manager.sync()
-            all_memory = memory_manager.read_all()
-            total_modules = len(all_memory)
-            total_functions = sum(len(m.functions) for m in all_memory.values())
+            index_manager.sync()
+            all_data = index_manager.read_all()
+            total_modules = len(all_data)
+            total_functions = sum(len(m.functions) for m in all_data.values())
             json_str = json.dumps(
-                {k: v.to_dict() for k, v in all_memory.items()},
+                {k: v.to_dict() for k, v in all_data.items()},
                 ensure_ascii=False,
             )
             est_tokens = len(json_str) // 4
             console.print(
-                f"[dim]记忆索引：{total_modules} 个模块，{total_functions} 个函数，"
+                f"[dim]代码索引：{total_modules} 个模块，{total_functions} 个函数，"
                 f"约 {est_tokens:,} tokens[/dim]"
             )
         except Exception as e:
-            console.print(f"[dim]记忆扫描失败：{e}[/dim]")
+            console.print(f"[dim]代码索引扫描失败：{e}[/dim]")
 
-    t = threading.Thread(target=_sync, daemon=True, name="memory-sync")
+    t = threading.Thread(target=_sync, daemon=True, name="index-sync")
     t.start()
 
 
-def display_memory_stats(console: Console, memory_manager) -> None:
-    """仅读取现有记忆索引并输出统计（不 sync，供 /init 完成后复用）。"""
+def display_memory_stats(console: Console, index_manager) -> None:
+    """仅读取现有代码索引并输出统计（不 sync，供 /init 完成后复用）。"""
     import json
     try:
-        all_memory = memory_manager.read_all()
-        total_modules = len(all_memory)
-        total_functions = sum(len(m.functions) for m in all_memory.values())
+        all_data = index_manager.read_all()
+        total_modules = len(all_data)
+        total_functions = sum(len(m.functions) for m in all_data.values())
         if total_modules == 0:
-            console.print("[dim]记忆索引：暂无数据[/dim]")
+            console.print("[dim]代码索引：暂无数据[/dim]")
             return
         json_str = json.dumps(
-            {k: v.to_dict() for k, v in all_memory.items()},
+            {k: v.to_dict() for k, v in all_data.items()},
             ensure_ascii=False,
         )
         est_tokens = len(json_str) // 4
         console.print(
-            f"[dim]记忆索引：{total_modules} 个模块，{total_functions} 个函数，"
+            f"[dim]代码索引：{total_modules} 个模块，{total_functions} 个函数，"
             f"约 {est_tokens:,} tokens[/dim]"
         )
     except Exception:
@@ -1401,9 +1401,9 @@ def main() -> None:
         super_mode=args.super_mode,
     )
 
-    # 初始化记忆管理器
-    memory_manager = get_memory_manager(project_root)
-    set_memory_manager(memory_manager)
+    # 初始化代码索引管理器
+    index_manager = get_index_manager(project_root)
+    set_index_manager(index_manager)
 
     # 初始化 LSP 客户端（懒启动，首次调用工具时才真正连接）
     set_lsp_root(project_root)
@@ -1436,7 +1436,7 @@ def main() -> None:
                 "[bold red]⚡ Super 模式已开启[/bold red]  [dim]所有操作无需确认[/dim]",
                 border_style="red", expand=False,
             ))
-        sync_and_display_memory(console, memory_manager)
+        sync_and_display_memory(console, index_manager)
         exit_code = run_headless(agent, args.print)
         sys.exit(exit_code)
     else:
@@ -1446,7 +1446,7 @@ def main() -> None:
                 "[bold red]⚡ Super 模式已开启[/bold red]  [dim]所有操作无需确认，使用 /super 可随时关闭[/dim]",
                 border_style="red", expand=False,
             ))
-        sync_and_display_memory(console, memory_manager)
+        sync_and_display_memory(console, index_manager)
         run_interactive_loop(agent, session_manager, cwd)
 
 

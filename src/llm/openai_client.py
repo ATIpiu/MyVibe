@@ -4,13 +4,14 @@
 依赖 base_client.LLMClient，支持流式 + 非流式调用。
 
 重试策略：
-  - 最多重试 3 次，指数退避 1s → 2s → 4s
+  - 最多重试 6 次，指数退避 1/2/4/8/16/32 秒（累计 ~63 秒）
   - 可重试：ChunkedEncodingError / ConnectionError / Timeout / 其他非 API 错误
   - 不重试：RuntimeError（由 _raise_for_api_error 抛出的 4xx/5xx API 错误）
 """
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from typing import Callable, Optional
@@ -18,8 +19,35 @@ from typing import Callable, Optional
 from .base_client import LLMClient, LLMResponse, ToolCall
 
 
-_MAX_RETRIES = 3
-_RETRY_DELAYS = [1, 2, 4]  # 指数退避秒数
+_MAX_RETRIES = 6
+_RETRY_DELAYS = [1, 2, 4, 8, 16, 32]  # 指数退避秒数，累计约 63s，覆盖后端短暂重启
+
+
+# 兜底：vLLM 在 Qwen3/DeepSeek-R1 等思考模型上如果未启用 --reasoning-parser，
+# 会把整块 <tool_call> XML 当 reasoning 吞掉，tool_calls 字段返回空。
+# 此函数从文本里反向提取 Hermes/Qwen3 XML 格式的 <tool_call> 调用。
+_TOOL_CALL_BLOCK = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_FUNCTION_NAME = re.compile(r"<function=([^>]+)>")
+_PARAMETER = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
+
+
+def _parse_hermes_tool_calls(text: str) -> list[ToolCall]:
+    """从 Hermes/Qwen3 XML 格式文本里解析出 tool_calls。无匹配返回空列表。"""
+    results: list[ToolCall] = []
+    if not text or "<tool_call>" not in text:
+        return results
+    for idx, block in enumerate(_TOOL_CALL_BLOCK.findall(text)):
+        name_m = _FUNCTION_NAME.search(block)
+        if not name_m:
+            continue
+        name = name_m.group(1).strip()
+        params: dict = {}
+        for key, value in _PARAMETER.findall(block):
+            params[key.strip()] = value.strip()
+        results.append(ToolCall(
+            name=name, tool_use_id=f"fallback_{idx}", input=params,
+        ))
+    return results
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -134,6 +162,7 @@ class OpenAIClient(LLMClient):
         temperature: float = 1.0,
         base_url: str = "https://api.openai.com/v1",
         history_file: Optional[str] = None,
+        extra_body: Optional[dict] = None,
     ) -> None:
         super().__init__(history_file=history_file)
 
@@ -147,12 +176,30 @@ class OpenAIClient(LLMClient):
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.base_url = base_url.rstrip("/")
+        # 附加请求体字段（OpenAI 官方忽略未知字段；vLLM/Qwen 等部署用这个传
+        # chat_template_kwargs 等自定义参数）
+        self.extra_body = extra_body or {}
 
     def _build_headers(self) -> dict:
         return {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
+
+    def health_check(self, timeout: float = 5.0) -> tuple[bool, str]:
+        """检测 base_url 后端是否可达（GET /models）。返回 (ok, detail)。"""
+        import requests
+        try:
+            r = requests.get(
+                f"{self.base_url}/models",
+                headers=self._build_headers(),
+                timeout=timeout,
+            )
+            if r.status_code < 500:
+                return True, f"HTTP {r.status_code}"
+            return False, f"HTTP {r.status_code}: {r.text[:200]}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
 
     def _raise_for_api_error(self, response) -> None:
         if response.status_code == 200:
@@ -196,12 +243,16 @@ class OpenAIClient(LLMClient):
             payload["tools"] = _to_openai_tools(tools)
             payload["tool_choice"] = "auto"
             payload["parallel_tool_calls"] = False
+        # merge extra_body（不覆盖已设字段）
+        for k, v in self.extra_body.items():
+            payload.setdefault(k, v)
 
         last_exc: Exception = RuntimeError("未知错误")
 
         for attempt in range(_MAX_RETRIES + 1):
             # 每次重试前重置所有缓冲区
             text_buffer = ""
+            reasoning_buffer = ""  # 累积 reasoning/reasoning_content，用于兜底解析
             tool_buffers: dict[str, dict] = {}
             usage = {
                 "input_tokens": 0,
@@ -270,6 +321,12 @@ class OpenAIClient(LLMClient):
                             if _on_text and not (cancel_event and cancel_event.is_set()):
                                 _on_text(text_delta)
 
+                        # 累积 reasoning 字段（Qwen3/DeepSeek-R1 等思考模型 vLLM 返回），
+                        # 若结尾 content+tool_calls 双空则从中解析 <tool_call> 兜底
+                        r_delta = delta.get("reasoning") or delta.get("reasoning_content")
+                        if r_delta:
+                            reasoning_buffer += r_delta
+
                         for tc in delta.get("tool_calls") or []:
                             index = tc.get("index", 0)
                             func = tc.get("function") or {}
@@ -322,9 +379,23 @@ class OpenAIClient(LLMClient):
                     raise RuntimeError(f"API 请求失败（已重试 {_MAX_RETRIES} 次）: {last_exc}") from last_exc
 
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
+        final_tool_calls = _parse_tool_buffers(tool_buffers)
+
+        # 兜底：content/tool_calls 均空但 reasoning 含 <tool_call> XML 时从中提取
+        # （vLLM 未开 --reasoning-parser 导致 Qwen3 tool_call 被扔进 reasoning 的场景）
+        if not text_buffer and not final_tool_calls and reasoning_buffer:
+            recovered = _parse_hermes_tool_calls(reasoning_buffer)
+            if recovered:
+                print(
+                    f"\n[openai_client] 从 reasoning 兜底解析出 {len(recovered)} 个 tool_call",
+                    flush=True,
+                )
+                final_tool_calls = recovered
+                stop_reason = "tool_calls"
+
         return LLMResponse(
             text_content=text_buffer,
-            tool_calls=_parse_tool_buffers(tool_buffers),
+            tool_calls=final_tool_calls,
             stop_reason=stop_reason,
             usage=usage,
             elapsed_ms=elapsed_ms,
@@ -358,6 +429,8 @@ class OpenAIClient(LLMClient):
             payload["tools"] = _to_openai_tools(tools)
             payload["tool_choice"] = "auto"
             payload["parallel_tool_calls"] = False
+        for k, v in self.extra_body.items():
+            payload.setdefault(k, v)
 
         last_exc: Exception = RuntimeError("未知错误")
         body: dict = {}
@@ -418,6 +491,19 @@ class OpenAIClient(LLMClient):
                 tool_use_id=tc.get("id", ""),
                 input=args,
             ))
+
+        # 兜底：同流式路径——content/tool_calls 空但 reasoning 含 <tool_call> 则解析
+        if not text_content and not tool_calls:
+            reasoning_text = message.get("reasoning") or message.get("reasoning_content") or ""
+            if reasoning_text:
+                recovered = _parse_hermes_tool_calls(reasoning_text)
+                if recovered:
+                    print(
+                        f"[openai_client] 从 reasoning 兜底解析出 {len(recovered)} 个 tool_call",
+                        flush=True,
+                    )
+                    tool_calls = recovered
+                    stop_reason = "tool_calls"
 
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
         response = LLMResponse(

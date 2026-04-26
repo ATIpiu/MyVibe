@@ -32,9 +32,14 @@ class AgentState:
     last_response_input_tokens: int = 0
     # 计划模式开关
     plan_mode: bool = False
-    # 记忆工具调用追踪（统计本会话中 read_memory 实际注入上下文的量）
+    # 索引工具调用追踪（统计本会话中 read_index 实际注入上下文的量）
     memory_tool_calls: int = 0
     memory_tool_tokens: int = 0
+    # 渐进披露：read_file 是否已通过 tool_result 注入披露给模型
+    read_file_unlocked: bool = False
+    # 已读 read_file 记录：每条 {"file_path", "offset", "limit", "read_time"}。
+    # 用于与文件 mtime 对比、阻止重复读取相同片段。
+    read_file_log: list[dict] = field(default_factory=list)
     # 会话名称（由子 Agent 根据第一条用户消息自动生成）
     name: str = ""
 
@@ -97,6 +102,9 @@ class AgentState:
             "total_output_tokens": self.total_output_tokens,
             "total_reasoning_tokens": self.total_reasoning_tokens,
             "total_cost_usd": self.total_cost_usd,
+            "memory_tool_calls": self.memory_tool_calls,
+            "read_file_unlocked": self.read_file_unlocked,
+            "read_file_log": self.read_file_log,
         }
 
     @classmethod
@@ -111,6 +119,9 @@ class AgentState:
         state.total_input_tokens = data.get("total_input_tokens", 0)
         state.total_output_tokens = data.get("total_output_tokens", 0)
         state.total_cost_usd = data.get("total_cost_usd", 0.0)
+        state.memory_tool_calls = data.get("memory_tool_calls", 0)
+        state.read_file_unlocked = data.get("read_file_unlocked", False)
+        state.read_file_log = data.get("read_file_log", [])
         return state
 
 

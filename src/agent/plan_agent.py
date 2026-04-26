@@ -17,7 +17,7 @@ PLAN_MODE_READONLY_TOOLS = {
     "read_file", "search_in_file",
     "glob_files", "grep_files",
     "git_status", "git_diff",
-    "read_memory", "rebuild_memory",
+    "rebuild_index", "find_symbol",
     "lsp_hover", "lsp_definition",
     "get_context_info",
     "ask_user",
@@ -46,7 +46,7 @@ EXIT_PLAN_MODE_TOOL = {
 PLAN_SYSTEM_PROMPT = """你是一个专业的代码任务规划助手，负责分析用户任务并制定详细执行计划。
 
 ## 核心约束
-- 只能使用只读工具（read_file、grep_files、glob_files、git_status、read_memory 等）
+- 只能使用只读工具（read_file、grep_files、glob_files、git_status 等）
 - 禁止调用任何写入或执行类工具（write_file、edit_file、shell、git_commit 等）
 - 目标是输出完整可执行的计划供用户确认，不执行任何修改
 

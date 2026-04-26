@@ -1,4 +1,4 @@
-"""记忆系统数据模型（层次化结构：模块 → 函数）。
+"""代码索引数据模型（层次化结构：模块 → 函数）。
 
 设计原则：以节省 token 为第一要务。
   - FunctionData：qualname（作为 key） + 一句话描述
@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class FunctionData:
-    """函数级记忆条目。key = qualname（含类名，如 MyClass.method）。"""
+    """函数级索引条目。key = qualname（含类名，如 MyClass.method）。"""
 
     purpose: str       # 一句话用途（docstring 第一行）
 
@@ -26,7 +26,7 @@ class FunctionData:
 
 @dataclass
 class ModuleData:
-    """模块级记忆条目，包含该模块所有函数。"""
+    """模块级索引条目，包含该模块所有函数。"""
 
     purpose: str       # 一句话描述（模块 docstring 第一行）
     functions: dict[str, FunctionData] = field(default_factory=dict)  # qualname -> FunctionData

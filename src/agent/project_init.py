@@ -17,11 +17,11 @@ _INIT_AGENT_PROMPT = """\
 
 ## 分析步骤（请按顺序执行）
 
-1. `read_memory(scope='all')` — 获取所有模块与函数索引，了解项目全貌
+1. `read_index(scope='all')` — 获取所有模块与函数索引，了解项目全貌
 2. 读取项目配置文件：`pyproject.toml` / `setup.py` / `requirements.txt` / `config/` 目录等
 3. 如有 README，读取它
 4. 读取主入口文件（如 `main.py`、`__main__.py`、`app.py`、`src/main.py` 等）
-5. 对核心模块用 `read_memory(scope='module', module_path=...)` 深入了解其职责
+5. 对核心模块用 `read_index(scope='module', module_path=...)` 深入了解其职责
 6. 通过 `git_log` / `git_status` 了解版本与近期改动
 
 ## MyVibe.md 写入要求

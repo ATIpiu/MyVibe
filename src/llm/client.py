@@ -49,7 +49,7 @@ def create_client_from_config(config: dict) -> LLMClient:
         api_key   - API 密钥（也可通过环境变量 OPENAI_API_KEY 设置）
 
     可选字段：
-        provider, model, max_tokens, temperature, base_url, history_file
+        provider, model, max_tokens, temperature, base_url, history_file, extra_body
     """
     provider = config.get("provider", "openai").lower()
     api_key = (
@@ -65,6 +65,7 @@ def create_client_from_config(config: dict) -> LLMClient:
         temperature=config.get("temperature", 1.0),
         base_url=config.get("base_url", "https://api.openai.com/v1"),
         history_file=config.get("history_file", "logs/conversation_history.jsonl"),
+        extra_body=config.get("extra_body") or {},
     )
 
 

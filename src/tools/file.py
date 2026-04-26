@@ -12,20 +12,19 @@ from .base_tool import BaseTool, ToolRegistry, ToolResult
 from ..utils.path import safe_resolve
 
 
-def _auto_sync_memory(file_path: str) -> None:
-    """写入/编辑成功后同步记忆索引（仅对 .py 文件）。"""
+def _auto_sync_index(file_path: str) -> None:
+    """写入/编辑成功后同步代码索引（仅对 .py 文件）。"""
     if not file_path.endswith(".py"):
         return
     try:
-        from .memory_tools import _manager
-        if _manager is None:
-            return
-        result = _manager.sync(file_path)
+        from .index.tools import get_injected_manager
+        mgr = get_injected_manager()
+        result = mgr.sync(file_path)
         count = result.get("functions_count", 0)
         if count is not None:
-            print(f"  [memory] 同步 {file_path}: {count} 个函数", flush=True)
+            print(f"  [index] 同步 {file_path}: {count} 个函数", flush=True)
     except Exception as e:
-        print(f"  [memory] 同步失败 {file_path}: {e}", flush=True)
+        print(f"  [index] 同步失败 {file_path}: {e}", flush=True)
 
 def _get_edit_context(file_path: Path, new_string: str, context_lines: int = 3) -> str:
     """返回 new_string 在文件中的所在位置及前后上下文行。
@@ -90,67 +89,6 @@ def _get_file_lock(file_path: str) -> threading.Lock:
 
 
 @ToolRegistry.register
-class ReadFileTool(BaseTool):
-    """带行号读取文件，支持分页。"""
-
-    name = "read_file"
-    description = (
-        "读取文件内容，每行带行号前缀。支持分页（offset/limit）。\n"
-        "返回格式：'行号→内容'，便于精确引用。\n\n"
-        "## 使用优先级：最低（最后手段）\n"
-        "在调用此工具前，应已经：\n"
-        "1. 用 read_memory(scope='all') 了解项目结构\n"
-        "2. 用 grep_files/glob_files 定位到目标文件和行号\n\n"
-        "已在本会话读取过的文件会被自动拦截（节省 token），"
-        "系统会提示改用 read_memory(scope='function') 获取函数级内容。\n\n"
-        "当目标明确时，用 offset+limit 只读需要的行，不要读整个文件。"
-    )
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "file_path": {
-                "type": "string",
-                "description": "要读取的文件的绝对路径或相对路径",
-            },
-            "offset": {
-                "type": "integer",
-                "description": "起始行号（从1开始），默认1",
-                "default": 1,
-            },
-            "limit": {
-                "type": "integer",
-                "description": "最多读取行数，默认2000",
-                "default": 2000,
-            },
-        },
-        "required": ["file_path"],
-    }
-
-    def execute(self, file_path: str, offset: int = 1, limit: int = 2000) -> ToolResult:
-        try:
-            resolved = safe_resolve(file_path)
-            if not resolved.exists():
-                return ToolResult(content=f"文件不存在: {file_path}", is_error=True)
-            if not resolved.is_file():
-                return ToolResult(content=f"路径不是文件: {file_path}", is_error=True)
-
-            lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
-            total = len(lines)
-            start = max(0, offset - 1)
-            end = min(start + limit, total)
-
-            numbered = "\n".join(
-                f"{i + 1:6d}→{line}" for i, line in enumerate(lines[start:end], start=start)
-            )
-            suffix = f"\n[... 共 {total} 行，显示 {start+1}-{end} 行]" if end < total else ""
-            return ToolResult(content=numbered + suffix)
-        except PermissionError as e:
-            return ToolResult(content=str(e), is_error=True)
-        except Exception as e:
-            return ToolResult(content=f"读取文件失败: {e}", is_error=True)
-
-
-@ToolRegistry.register
 class WriteFileTool(BaseTool):
     """完整写入或创建文件，自动创建父目录。"""
 
@@ -181,7 +119,7 @@ class WriteFileTool(BaseTool):
             with lock:
                 resolved.parent.mkdir(parents=True, exist_ok=True)
                 resolved.write_text(content, encoding="utf-8")
-            _auto_sync_memory(str(resolved))
+            _auto_sync_index(str(resolved))
             return ToolResult(content=f"已写入 {resolved}（{len(content.splitlines())} 行）")
         except PermissionError as e:
             return ToolResult(content=str(e), is_error=True)
@@ -259,7 +197,7 @@ class EditFileTool(BaseTool):
 
                 resolved.write_text(modified, encoding="utf-8")
 
-            _auto_sync_memory(str(resolved))
+            _auto_sync_index(str(resolved))
             ctx = _get_edit_context(resolved, new_string)
             suffix = f"\n\n修改后上下文：\n{ctx}" if ctx else ""
             return ToolResult(content=f"已替换 {replaced} 处 in {resolved}{suffix}")
@@ -277,17 +215,15 @@ class GlobFilesTool(BaseTool):
     description = (
         "快速文件名模式匹配（glob），按修改时间倒序返回匹配路径列表。\n\n"
         "## 工具使用优先级链\n"
-        "1. read_memory(scope='all') → 了解项目模块结构\n"
+        "1. read_file(scope='overview') → 了解项目模块结构\n"
         "2. glob_files（本工具）→ 按名称模式定位文件\n"
-        "3. grep_files → 按内容定位具体位置\n"
-        "4. read_file → 仅当需要完整上下文时才读取\n\n"
+        "3. grep_files → 按内容定位具体位置\n\n"
         "## 适用场景\n"
         "- 查找特定模式的文件：**/*.py、src/**/*.ts\n"
         "- 确认文件是否存在\n"
         "- 获取目录下的文件列表\n\n"
         "## 不适用场景\n"
         "- 搜索文件内容 → 用 grep_files\n"
-        "- 已知确切路径 → 直接 read_file\n"
         "不要用 shell find/ls 替代此工具。"
     )
     input_schema = {
@@ -340,11 +276,8 @@ class GrepFilesTool(BaseTool):
     description = (
         "正则内容搜索（基于 ripgrep 或 Python re 回退）。支持跨文件和单文件（path 指向具体文件）。\n\n"
         "## 工具使用优先级链\n"
-        "1. read_memory → 了解项目模块/函数结构\n"
-        "2. grep_files（本工具）→ 定位到具体位置（文件+行号）\n"
-        "3. read_file → 仅当需要完整上下文时才读取文件\n\n"
-        "用此工具确定目标函数位置后，用 read_file 的 offset+limit 只读那几行，"
-        "而不是读整个文件。\n\n"
+        "1. read_file(scope='overview'/'file'/'function') → 了解项目模块/函数结构\n"
+        "2. grep_files（本工具）→ 定位到具体位置（文件+行号）\n\n"
         "## 输出模式（output_mode）\n"
         "- files_with_matches（默认）：只返回匹配的文件路径，适合快速定位\n"
         "- content：返回匹配行及上下文，适合直接查看代码\n"
@@ -408,7 +341,16 @@ class GrepFilesTool(BaseTool):
         case_insensitive = kwargs.get("-i", False)
         head_limit = kwargs.get("head_limit")
 
-        base = str(Path(path) if path else safe_resolve("."))
+        base_path = Path(path) if path else safe_resolve(".")
+        base = str(base_path)
+
+        # 单文件路径直接走 Python re 精准搜索；rg 在 `-l`/`--glob` 组合下对单文件行为
+        # 与目录不一致（会因 .gitignore 或搜索根判定导致假阴性），不适合作为单文件搜索。
+        if base_path.exists() and base_path.is_file():
+            return self._single_file_grep(
+                pattern, base_path, output_mode, after, before,
+                case_insensitive, head_limit,
+            )
 
         # 优先尝试 ripgrep
         result = self._try_rg(
@@ -423,6 +365,57 @@ class GrepFilesTool(BaseTool):
             pattern, base, glob_filter, output_mode, after, before,
             case_insensitive, head_limit,
         )
+
+    def _single_file_grep(
+        self, pattern, file_path: Path, output_mode, after, before,
+        case_insensitive, head_limit,
+    ) -> ToolResult:
+        """对单个文件直接用 Python re 搜索，绕过 rg 对单文件的不一致行为。"""
+        try:
+            flags = re.IGNORECASE if case_insensitive else 0
+            regex = re.compile(pattern, flags)
+        except re.error as e:
+            return ToolResult(content=f"正则表达式错误: {e}", is_error=True)
+
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return ToolResult(content=f"读取文件失败: {e}", is_error=True)
+
+        lines = text.splitlines()
+        match_indices = [i for i, ln in enumerate(lines) if regex.search(ln)]
+
+        rel = str(file_path)
+        if not match_indices:
+            return ToolResult(
+                content=(
+                    f"未找到匹配 '{pattern}'（已在单文件 {rel} 中搜索 {len(lines)} 行）。\n"
+                    "若确信应有匹配：检查正则转义是否正确；或去掉 path 参数改做全局搜索。"
+                )
+            )
+
+        if output_mode == "files_with_matches":
+            return ToolResult(content=rel)
+        if output_mode == "count":
+            return ToolResult(content=f"{rel}: {len(match_indices)}")
+
+        # content 模式：输出带上下文
+        out: list[str] = []
+        shown: set[int] = set()
+        for idx in match_indices:
+            start = max(0, idx - before)
+            end = min(len(lines), idx + after + 1)
+            if out:
+                out.append("--")
+            for i in range(start, end):
+                if i in shown:
+                    continue
+                marker = ":" if i == idx else "-"
+                out.append(f"{rel}:{i + 1}{marker}{lines[i]}")
+                shown.add(i)
+        if head_limit:
+            out = out[:head_limit]
+        return ToolResult(content="\n".join(out))
 
     def _try_rg(
         self, pattern, base, glob_filter, output_mode, after, before,
@@ -453,7 +446,13 @@ class GrepFilesTool(BaseTool):
 
             output = proc.stdout.strip()
             if not output:
-                return ToolResult(content=f"未找到匹配: {pattern}")
+                return ToolResult(
+                    content=(
+                        f"未找到匹配: {pattern}（搜索根: {base}）\n"
+                        "建议：1) 检查正则转义；2) 用更短关键词；"
+                        "3) 去掉 path/glob 限制；4) 试 read_file(scope='overview')"
+                    )
+                )
 
             lines = output.splitlines()
             if head_limit:
