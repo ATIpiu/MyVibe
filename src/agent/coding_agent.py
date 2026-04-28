@@ -1,6 +1,7 @@
 """CodingAgent：核心 agentic 循环、权限管理、工具并行执行。"""
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
 from typing import Optional
@@ -23,6 +24,22 @@ from ..tools.index.tools import set_index_manager
 # 需要重启用时取消注释下一行 + run_turn 末尾对应调用。
 # from ..tools.git import auto_commit_turn
 from ..tools.index.manager import get_index_manager
+
+def _ensure_git_safe_dir(cwd: str) -> None:
+    """容器/跨用户环境下自动修复 git safe.directory，避免 git_status 报 dubious ownership。"""
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--git-dir"],
+            capture_output=True, timeout=5,
+        )
+        if b"dubious ownership" in r.stderr:
+            subprocess.run(
+                ["git", "config", "--global", "--add", "safe.directory", cwd],
+                capture_output=True, timeout=5,
+            )
+    except Exception:
+        pass
+
 
 # 自动允许（无需确认）的工具列表（可由配置覆盖）
 DEFAULT_AUTO_ALLOW = {
@@ -216,6 +233,9 @@ class CodingAgent(BaseAgent):
 
         # 将 cancel 事件注入权限管理器，Ctrl+C 时跳过 stdin 阻塞
         self.permission._cancel_event = self._cancel
+
+        # 容器/跨用户环境下自动修复 git safe.directory（避免第一步 git_status 报错）
+        _ensure_git_safe_dir(self.state.cwd)
 
         # 系统提示词只在初始化时构建一次，后续不再修改
         self._system = build_system_prompt(
@@ -422,11 +442,10 @@ class CodingAgent(BaseAgent):
                     "is_error": False,
                 }
 
-            # read_file 已读检测：相同 (file_path, offset, limit) 且文件 mtime ≤ 上次
-            # 读取时刻 → 直接返回提示，避免把同一段内容塞回上下文浪费 token。
-            # offset/limit 任一不同则视作不同片段，正常读取。
+            # read_file(scope='function') dedup：同一 function_key 在会话内只需读一次。
+            # 其他 scope（overview/file）开销小，不做 dedup。
             if tool_name == "read_file":
-                _hit = self._check_read_file_already_read(args)
+                _hit = self._check_read_file_cache(args)
                 if _hit is not None:
                     elapsed = int(time.monotonic() * 1000) - start_ms
                     self.logger.tool_result(
@@ -504,9 +523,9 @@ class CodingAgent(BaseAgent):
                     if file_path:
                         self.context_manager.invalidate(file_path)
 
-                # read_file 成功 → 记录 (file_path, offset, limit, read_time) + 统计
+                # read_file 成功 → 写入 dedup 缓存 + 统计
                 if tool_name == "read_file" and not result.is_error:
-                    self._record_read_file(args)
+                    self._record_read_file_cache(args)
                     self.state.memory_tool_calls += 1
                     self.state.memory_tool_tokens += len(result.content or "") // 4
 
@@ -581,93 +600,30 @@ class CodingAgent(BaseAgent):
         """（已在 logger.tool_call 中渲染，此处保留扩展点）"""
         pass
 
-    @staticmethod
-    def _normalize_read_file_key(args: dict) -> Optional[tuple[str, int, int]]:
-        """从 args 解出 (resolved_path, offset, limit)，失败返回 None。"""
-        fp = args.get("file_path", "")
-        if not fp:
-            return None
-        try:
-            from ..utils.path import safe_resolve
-            resolved = safe_resolve(fp)
-        except Exception:
-            return None
-        try:
-            off = int(args.get("offset", 1) or 1)
-            lim = int(args.get("limit", 2000) or 2000)
-        except (ValueError, TypeError):
-            return None
-        return str(resolved), off, lim
+    def _check_read_file_cache(self, args: dict) -> Optional[str]:
+        """仅对 scope='function' 做 dedup：同一 function_key 在会话内已读过则返回提示。
 
-    def _check_read_file_already_read(self, args: dict) -> Optional[str]:
-        """命中已读返回提示串；未命中返回 None。
-
-        命中条件：log 中存在精确匹配 (resolved_path, offset, limit) 的记录，
-        且当前文件 mtime ≤ 上次 read_time（即未被编辑过）。
+        其他 scope 开销小（overview 是全局树；file 是列表），不做缓存。
         """
-        key = self._normalize_read_file_key(args)
-        if key is None:
+        if args.get("scope") != "function":
             return None
-        resolved_str, off, lim = key
-        try:
-            from pathlib import Path
-            p = Path(resolved_str)
-            if not p.exists() or not p.is_file():
-                return None
-            mtime = p.stat().st_mtime
-        except Exception:
+        key = args.get("function_key", "")
+        if not key:
             return None
-
-        # 取最近一次同 key 的记录
-        for record in reversed(self.state.read_file_log):
-            if (
-                record.get("file_path") == resolved_str
-                and record.get("offset") == off
-                and record.get("limit") == lim
-            ):
-                last_read = record.get("read_time", 0.0)
-                if mtime <= last_read:
-                    fmt = lambda ts: time.strftime(
-                        "%Y-%m-%d %H:%M:%S", time.localtime(ts)
-                    )
-                    return (
-                        f"[已读提示] 你已读过该文件的相同片段，且文件自上次读取后未被编辑：\n"
-                        f"  file_path = {args.get('file_path', '')}\n"
-                        f"  offset    = {off}\n"
-                        f"  limit     = {lim}\n"
-                        f"  上次读取 = {fmt(last_read)}\n"
-                        f"  文件 mtime = {fmt(mtime)}\n"
-                        f"内容已在之前的对话历史中，无需重复读取。"
-                        f"如需查看不同行段，请改变 offset/limit。"
-                    )
-                # 文件已编辑过 → 允许读
-                return None
+        if key in self.state.read_file_cache:
+            return (
+                f"[已读提示] 函数 `{key}` 的源码已在本会话上下文中，无需重复读取。\n"
+                f"如需查看其他函数，请修改 function_key。"
+            )
         return None
 
-    def _record_read_file(self, args: dict) -> None:
-        """记录一次成功的 read_file 调用，去重保留最新的同 key 记录。"""
-        key = self._normalize_read_file_key(args)
-        if key is None:
+    def _record_read_file_cache(self, args: dict) -> None:
+        """记录一次成功的 read_file(scope='function') 调用，用于 dedup。"""
+        if args.get("scope") != "function":
             return
-        resolved_str, off, lim = key
-        # 去掉旧的同 key 记录，再追加新的（保持单条最新）
-        self.state.read_file_log = [
-            r for r in self.state.read_file_log
-            if not (
-                r.get("file_path") == resolved_str
-                and r.get("offset") == off
-                and r.get("limit") == lim
-            )
-        ]
-        self.state.read_file_log.append({
-            "file_path": resolved_str,
-            "offset": off,
-            "limit": lim,
-            "read_time": time.time(),
-        })
-        # 限长，避免会话长跑后无限增长
-        if len(self.state.read_file_log) > 200:
-            self.state.read_file_log = self.state.read_file_log[-200:]
+        key = args.get("function_key", "")
+        if key:
+            self.state.read_file_cache[key] = time.time()
 
     def _name_session_async(self) -> None:
         """子 Agent：根据第一条用户消息为会话命名。

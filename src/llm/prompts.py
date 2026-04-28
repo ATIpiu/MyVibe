@@ -73,6 +73,7 @@ def my_func(...):
 - 保持简洁，直接给出结论和操作
 - 代码修改时说明改动原因
 - 遇到不确定时主动询问，不要猜测用户意图
+- **已确认目标时直接执行**：若已通过工具确认了目标文件、函数和改动内容，立即调用 edit_file/write_file，不需要再次确认。"主动询问"适用于任务本身有歧义，而非执行前的犹豫。
 
 {myvibe_context}{memory_context}{proactive_memory}{plan_mode_section}
 ## 可用工具（共 {tool_count} 个）
