@@ -15,7 +15,7 @@ from .base_agent import BaseAgent
 from .state import AgentState, SessionManager
 from ..context.context_manager import ContextManager
 from ..llm.client import LLMClient, ToolCall
-from ..llm.prompts import build_system_prompt, build_tool_descriptions
+from ..llm.prompts import build_system_prompt, build_system_prompt_parts, build_tool_descriptions
 from ..logger.structured_logger import StructuredLogger
 from ..tools.base_tool import ToolRegistry, ToolResult
 from ..tools.context_tools import set_context_manager
@@ -237,13 +237,15 @@ class CodingAgent(BaseAgent):
         # 容器/跨用户环境下自动修复 git safe.directory（避免第一步 git_status 报错）
         _ensure_git_safe_dir(self.state.cwd)
 
-        # 系统提示词只在初始化时构建一次，后续不再修改
-        self._system = build_system_prompt(
+        # 系统提示词：拆成静态+动态两段，通过 build_cached_system 合并
+        # AnthropicClient 会返回带 cache_control 的 list；其他后端返回拼接字符串
+        _static, _dynamic = build_system_prompt_parts(
             tool_descriptions="",
             cwd=self.state.cwd,
             tool_count=len(self._tools_schema),
         )
-        self.state.system_prompt = self._system
+        self._system = self.llm.build_cached_system(_static, _dynamic)
+        self.state.system_prompt = self.llm._system_to_str(self._system)
 
     def run_turn(self, user_input: str) -> str:
         """核心 agentic 循环。

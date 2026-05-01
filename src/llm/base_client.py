@@ -2,13 +2,18 @@
 
 职责划分：
   - 数据类：StreamEvent / ToolCall / LLMResponse / HistoryEntry
-  - LLMClient：抽象接口 + 历史收集钩子
+  - LLMClient：抽象接口 + 历史收集钩子 + Prompt Cache 分区支持
   - 子类只需实现 _stream_chat_impl() 和 count_tokens()
 
 历史收集策略：
   每次调用 stream_chat / chat，通过比较 messages 列表长度，
   增量保存「本次新增的输入消息」和「LLM 返回的完整响应」，
   确保工具调用结果、中间轮次消息不会丢失。
+
+Prompt Cache 支持：
+  - build_cached_system(static, dynamic) 默认返回拼接字符串
+  - AnthropicClient 覆盖后返回带 cache_control 的 list[dict]
+  - stream_chat 的 system 参数接受 str 或 list[dict]
 """
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 
 # ─────────────────────── 公共数据类 ───────────────────────
@@ -131,6 +136,26 @@ class LLMClient(abc.ABC):
         self.session_reasoning_tokens: int = 0
         self.session_cost_usd: float = 0.0
 
+    # ── Prompt Cache 分区支持 ─────────────────────────────────
+
+    def build_cached_system(self, static: str, dynamic: str) -> "Union[str, list[dict]]":
+        """将静态 + 动态两段 system prompt 合并。
+
+        默认实现：直接拼接为字符串（OpenAI 兼容后端）。
+        AnthropicClient 覆盖此方法，返回带 cache_control 的 list[dict]。
+        """
+        parts = [p for p in [static, dynamic] if p.strip()]
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _system_to_str(system: "Optional[Union[str, list[dict]]]") -> str:
+        """将 system（字符串或 Anthropic blocks 列表）统一转为纯字符串。"""
+        if isinstance(system, list):
+            return "\n\n".join(
+                b.get("text", "") for b in system if isinstance(b, dict)
+            )
+        return system or ""
+
     # ── Session-level token 累计 ──────────────────────────────
 
     def _accumulate_session(self, response: LLMResponse) -> None:
@@ -199,18 +224,19 @@ class LLMClient(abc.ABC):
                 # 历史写入失败不阻断主流程
                 print(f"[LLMClient] 历史写入失败: {exc}")
 
-    def _record_system_prompt(self, system: Optional[str]) -> None:
+    def _record_system_prompt(self, system: "Optional[Union[str, list[dict]]]") -> None:
         """记录系统提示词（仅在内容发生变化时写入，避免每轮重复）。"""
         if not system:
             return
-        if system == self._last_system_prompt:
+        system_str = self._system_to_str(system)
+        if system_str == self._last_system_prompt:
             return
-        self._last_system_prompt = system
+        self._last_system_prompt = system_str
         entry = HistoryEntry(
             timestamp=self._now_iso(),
             entry_type="input_message",
             role="system",
-            content=system,
+            content=system_str,
         )
         self._append_entry(entry)
 
@@ -261,7 +287,7 @@ class LLMClient(abc.ABC):
     def stream_chat(
         self,
         messages: list[dict],
-        system: Optional[str] = None,
+        system: "Optional[Union[str, list[dict]]]" = None,
         tools: Optional[list[dict]] = None,
         on_text: Optional[Callable[[str], None]] = None,
         on_tool_start: Optional[Callable[[str, str], None]] = None,
@@ -274,7 +300,9 @@ class LLMClient(abc.ABC):
 
         Args:
             messages: 完整对话历史（Anthropic 格式）
-            system: 系统提示词
+            system: 系统提示词。字符串或 Anthropic cache_control blocks 列表。
+                    列表格式由 build_cached_system() 生成，AnthropicClient 直接使用，
+                    OpenAI 兼容客户端会自动合并为字符串。
             tools: 工具 schema 列表（Anthropic 格式）
             on_text: 每个文本 delta 的实时回调
             on_tool_start: 工具调用出现时的回调 (tool_name, tool_use_id)
@@ -325,7 +353,7 @@ class LLMClient(abc.ABC):
     def _stream_chat_impl(
         self,
         messages: list[dict],
-        system: Optional[str] = None,
+        system: "Optional[Union[str, list[dict]]]" = None,
         tools: Optional[list[dict]] = None,
         on_text: Optional[Callable[[str], None]] = None,
         on_tool_start: Optional[Callable[[str, str], None]] = None,
@@ -334,7 +362,7 @@ class LLMClient(abc.ABC):
         """实际流式推理逻辑，由子类提供。"""
 
     @abc.abstractmethod
-    def count_tokens(self, messages: list[dict], system: str = "") -> int:
+    def count_tokens(self, messages: list[dict], system: "Union[str, list[dict]]" = "") -> int:
         """估算 token 数（用于上下文比例监控）。"""
 
     def calc_cost(self, input_tokens: int, output_tokens: int) -> float:

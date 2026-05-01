@@ -1,4 +1,5 @@
 llm:
+  # ── OpenAI 兼容（GLM / DeepSeek / 本地 vLLM 等）────────────────────────
   provider: openai                       # 支持所有兼容 OpenAI Chat Completions 协议的服务
   model: gpt-4o                          # 模型名称，按所用服务填写
   api_key: "YOUR_API_KEY_HERE"           # 或设置环境变量 OPENAI_API_KEY
@@ -6,6 +7,14 @@ llm:
   max_tokens: 8192
   temperature: 1.0
   history_file: "logs/conversation_history.jsonl"
+
+  # ── Anthropic 原生（支持 Prompt Cache，降低 60-90% 重复 token 费用）──────
+  # provider: anthropic
+  # model: claude-sonnet-4-6             # 支持 claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5
+  # api_key: "YOUR_ANTHROPIC_API_KEY"    # 或设置环境变量 ANTHROPIC_API_KEY
+  # max_tokens: 8192
+  # temperature: 1.0
+  # history_file: "logs/conversation_history.jsonl"
 
 agent:
   max_tool_workers: 4

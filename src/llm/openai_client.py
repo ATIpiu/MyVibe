@@ -228,8 +228,9 @@ class OpenAIClient(LLMClient):
         start_time = time.monotonic()
 
         oai_messages = _to_openai_messages(list(messages))
-        if system:
-            oai_messages = [{"role": "system", "content": system}] + oai_messages
+        system_str = self._system_to_str(system)
+        if system_str:
+            oai_messages = [{"role": "system", "content": system_str}] + oai_messages
 
         payload: dict = {
             "model": self.model,
@@ -415,8 +416,9 @@ class OpenAIClient(LLMClient):
         self._record_new_messages(messages)
 
         oai_messages = _to_openai_messages(list(messages))
-        if system:
-            oai_messages = [{"role": "system", "content": system}] + oai_messages
+        system_str = self._system_to_str(system)
+        if system_str:
+            oai_messages = [{"role": "system", "content": system_str}] + oai_messages
 
         payload: dict = {
             "model": self.model,
@@ -517,10 +519,14 @@ class OpenAIClient(LLMClient):
         self._record_response(response)
         return response
 
-    def count_tokens(self, messages: list[dict], system: str = "") -> int:
-        total_chars = len(system)
+    def count_tokens(self, messages: list[dict], system="") -> int:
+        total_chars = len(self._system_to_str(system))
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
                 total_chars += len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        total_chars += len(block.get("text", "") or block.get("content", ""))
         return total_chars // 4 + 10

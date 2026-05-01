@@ -1,4 +1,9 @@
-"""系统提示词构建：组装 system prompt、工具描述、memory 上下文。"""
+"""系统提示词构建：组装 system prompt、工具描述、memory 上下文。
+
+提示词分为两段：
+  _STATIC_PROMPT   — 规则/能力描述，内容稳定，适合 Prompt Cache 缓存
+  _DYNAMIC_TEMPLATE — 当前环境、记忆上下文，每轮可变，不缓存
+"""
 from __future__ import annotations
 
 import os
@@ -25,13 +30,9 @@ def detect_platform() -> str:
         return f"Linux / {shell}"
 
 
-SYSTEM_PROMPT_TEMPLATE = """你是一个专业的 AI 编程助手，运行在用户的本地机器上。
+# ─── 静态部分（规则 + 能力，内容稳定，适合缓存）────────────────────────────
 
-## 当前环境
-- 工作目录: {cwd}
-- 时间: {timestamp}
-- 可用工具: {tool_count} 个
-- 操作系统: {platform_info}
+_STATIC_PROMPT = """你是一个专业的 AI 编程助手，运行在用户的本地机器上。
 
 > **Shell 注意**：请根据上方操作系统使用正确的命令语法。
 > Windows PowerShell：用 `Get-Location`/`Set-Location`/`Get-ChildItem`，不用 `pwd`/`cd`/`ls`。
@@ -39,7 +40,7 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个专业的 AI 编程助手，运行在用
 > Linux/macOS：用 `pwd`/`ls`/`cd`。
 
 ## 你的能力
-你可以读写文件、执行命令、分析代码、使用 git。   
+你可以读写文件、执行命令、分析代码、使用 git。
 你有访问完整项目的能力，可以独立完成复杂的编程任务。
 
 ## 代码探索策略（重要）
@@ -73,12 +74,23 @@ def my_func(...):
 - 保持简洁，直接给出结论和操作
 - 代码修改时说明改动原因
 - 遇到不确定时主动询问，不要猜测用户意图
-- **已确认目标时直接执行**：若已通过工具确认了目标文件、函数和改动内容，立即调用 edit_file/write_file，不需要再次确认。"主动询问"适用于任务本身有歧义，而非执行前的犹豫。
+- **已确认目标时直接执行**：若已通过工具确认了目标文件、函数和改动内容，立即调用 edit_file/write_file，不需要再次确认。"主动询问"适用于任务本身有歧义，而非执行前的犹豫。"""
 
-{myvibe_context}{memory_context}{proactive_memory}{plan_mode_section}
-## 可用工具（共 {tool_count} 个）
+
+# ─── 动态部分（环境上下文，每轮可变，不缓存）────────────────────────────────
+
+_DYNAMIC_TEMPLATE = """## 当前环境
+- 工作目录: {cwd}
+- 时间: {timestamp}
+- 可用工具: {tool_count} 个
+- 操作系统: {platform_info}
+
+{myvibe_context}{memory_context}{proactive_memory}{plan_mode_section}## 可用工具（共 {tool_count} 个）
 工具 schema 已通过 API 参数传递，按需调用即可。
 """
+
+# 向后兼容：外部代码若直接引用该常量仍可使用
+SYSTEM_PROMPT_TEMPLATE = _STATIC_PROMPT + "\n\n" + _DYNAMIC_TEMPLATE
 
 PLAN_MODE_BLOCK = """
 ## 计划模式（已激活）
@@ -107,9 +119,56 @@ PLAN_MODE_BLOCK = """
 """
 
 
+def build_system_prompt_parts(
+    tool_descriptions: str = "",
+    cwd: str = ".",
+    memory_context: str = "",
+    timestamp: Optional[str] = None,
+    tool_count: int = 0,
+    proactive_memory: str = "",
+    myvibe_context: str = "",
+    platform_info: str = "",
+    plan_mode: bool = False,
+) -> tuple[str, str]:
+    """返回 (static_text, dynamic_text) 两段，用于 Prompt Cache 分区。
+
+    static_text  — 规则/能力描述，适合加 cache_control 缓存
+    dynamic_text — 当前环境、记忆上下文，每次调用可变
+    """
+    if timestamp is None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    myvibe_section = ""
+    if myvibe_context.strip():
+        myvibe_section = f"\n## 项目记忆（MyVibe.md）\n{myvibe_context.strip()}\n\n"
+
+    memory_section = ""
+    if memory_context.strip():
+        memory_section = f"\n## 全局记忆（AGENT.md）\n{memory_context.strip()}\n\n"
+
+    proactive_section = ""
+    if proactive_memory.strip():
+        proactive_section = f"\n{proactive_memory.strip()}\n\n"
+
+    plan_section = PLAN_MODE_BLOCK if plan_mode else ""
+
+    dynamic = _DYNAMIC_TEMPLATE.format(
+        cwd=cwd,
+        timestamp=timestamp,
+        tool_count=tool_count,
+        platform_info=platform_info or detect_platform(),
+        myvibe_context=myvibe_section,
+        memory_context=memory_section,
+        proactive_memory=proactive_section,
+        plan_mode_section=plan_section,
+    )
+
+    return _STATIC_PROMPT, dynamic
+
+
 def build_system_prompt(
-    tool_descriptions: str,
-    cwd: str,
+    tool_descriptions: str = "",
+    cwd: str = ".",
     memory_context: str = "",
     timestamp: Optional[str] = None,
     tool_count: int = 0,
@@ -118,48 +177,23 @@ def build_system_prompt(
     platform_info: str = "",
     plan_mode: bool = False,
 ) -> str:
-    """填充系统提示词模板。
+    """填充系统提示词模板，返回完整字符串。
 
-    Args:
-        tool_descriptions: 工具 schema 的人类可读描述
-        cwd: 当前工作目录
-        memory_context: AGENT.md 内容（可选）
-        timestamp: ISO8601 时间戳，None 时自动生成
-        tool_count: 工具总数
-        proactive_memory: 主动记忆注入内容（按用户输入检索）
-        myvibe_context: MyVibe.md 项目记忆内容（可选）
-
-    Returns:
-        完整系统提示词字符串
+    两段拼接版本，供不支持 cache_control 的后端使用。
+    支持 cache_control 的后端（AnthropicClient）请改用 build_system_prompt_parts()。
     """
-    if timestamp is None:
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    myvibe_section = ""
-    if myvibe_context.strip():
-        myvibe_section = f"\n## 项目记忆（MyVibe.md）\n{myvibe_context.strip()}\n"
-
-    memory_section = ""
-    if memory_context.strip():
-        memory_section = f"\n## 全局记忆（AGENT.md）\n{memory_context.strip()}\n"
-
-    proactive_section = ""
-    if proactive_memory.strip():
-        proactive_section = f"\n{proactive_memory.strip()}\n"
-
-    plan_mode_section = PLAN_MODE_BLOCK if plan_mode else ""
-
-    return SYSTEM_PROMPT_TEMPLATE.format(
+    static, dynamic = build_system_prompt_parts(
+        tool_descriptions=tool_descriptions,
         cwd=cwd,
+        memory_context=memory_context,
         timestamp=timestamp,
         tool_count=tool_count,
-        tool_descriptions=tool_descriptions,
-        myvibe_context=myvibe_section,
-        memory_context=memory_section,
-        proactive_memory=proactive_section,
-        plan_mode_section=plan_mode_section,
-        platform_info=platform_info or detect_platform(),
+        proactive_memory=proactive_memory,
+        myvibe_context=myvibe_context,
+        platform_info=platform_info,
+        plan_mode=plan_mode,
     )
+    return static + "\n\n" + dynamic
 
 
 def build_tool_descriptions(tools_schema: list[dict]) -> str:

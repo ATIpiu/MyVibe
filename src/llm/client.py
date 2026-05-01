@@ -23,6 +23,7 @@ from .base_client import (
 
 # ── 具体实现（re-export） ─────────────────────────────────────────────────
 from .openai_client import OpenAIClient
+from .anthropic_client import AnthropicClient
 
 __all__ = [
     "LLMClient",
@@ -31,6 +32,7 @@ __all__ = [
     "ToolCall",
     "HistoryEntry",
     "OpenAIClient",
+    "AnthropicClient",
     "create_client_from_config",
     "register_provider",
 ]
@@ -39,6 +41,7 @@ __all__ = [
 
 _PROVIDER_MAP: dict[str, type[LLMClient]] = {
     "openai": OpenAIClient,
+    "anthropic": AnthropicClient,
 }
 
 
@@ -58,12 +61,24 @@ def create_client_from_config(config: dict) -> LLMClient:
     )
 
     cls = _PROVIDER_MAP.get(provider, OpenAIClient)
+
+    # Anthropic 默认 base_url 不同
+    default_base = (
+        "https://api.anthropic.com"
+        if provider == "anthropic"
+        else "https://api.openai.com/v1"
+    )
+
+    # anthropic_key 优先，兜底 ANTHROPIC_API_KEY 环境变量
+    if provider == "anthropic" and not api_key:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+
     return cls(
         model=config.get("model", "gpt-4o"),
         api_key=api_key,
         max_tokens=config.get("max_tokens", 8192),
         temperature=config.get("temperature", 1.0),
-        base_url=config.get("base_url", "https://api.openai.com/v1"),
+        base_url=config.get("base_url", default_base),
         history_file=config.get("history_file", "logs/conversation_history.jsonl"),
         extra_body=config.get("extra_body") or {},
     )
